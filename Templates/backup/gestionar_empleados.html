@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Gestión de Empleados</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --color-primario: #0d6efd;
+            --color-secundario: #6c757d;
+            --color-exito: #198754;
+            --color-peligro: #dc3545;
+            --color-advertencia: #ffc107;
+            --color-info: #0dcaf0;
+            --color-fondo: #f8f9fa;
+            --color-superficie: #ffffff;
+            --sombra-suave: 0 4px 8px rgba(0,0,0,0.05);
+        }
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: var(--color-fondo); color: #333; }
+        .container { max-width: 1600px; margin: 2em auto; padding: 2em; background-color: var(--color-superficie); border-radius: 12px; box-shadow: var(--sombra-suave); }
+        h1, h2 { color: #333; border-bottom: 1px solid #dee2e6; padding-bottom: 10px; }
+        .form-registro { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 25px; margin-bottom: 2em; }
+        .form-group { display: flex; flex-direction: column; }
+        label { margin-bottom: 0.5em; font-weight: 500; font-size: 0.9em; color: #555; }
+        input, select, textarea { padding: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 1em; font-family: 'Roboto', sans-serif; transition: border-color 0.2s, box-shadow 0.2s; }
+        input:focus, select:focus, textarea:focus { border-color: var(--color-primario); box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.25); outline: none; }
+        input[readonly] { background-color: #e9ecef; cursor: not-allowed; }
+        hr { grid-column: 1 / -1; border: 0; border-top: 1px solid #eee; margin: 1em 0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1em; }
+        th, td { border-bottom: 1px solid #ddd; padding: 14px; text-align: left; }
+        th { background-color: var(--color-fondo); font-weight: 700; }
+        a { color: var(--color-primario); text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; }
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: 500; text-decoration: none; transition: all 0.2s ease; }
+        .btn-success { background-color: var(--color-exito); color: white; }
+        .btn-success:hover { background-color: #157347; }
+        .btn-success:disabled { background-color: #9ca3af; cursor: not-allowed; }
+        .btn-primary { background-color: var(--color-primario); color: white; }
+        .btn-warning { background-color: var(--color-advertencia); color: black; }
+        .btn-danger { background-color: var(--color-peligro); color: white; }
+        .btn-info { background-color: var(--color-info); color: white; }
+        .btn-info:hover { background-color: #0aa2c0; }
+        .panel { margin-bottom: 2em; padding: 1.5em; background-color: var(--color-fondo); border-radius: 8px; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; }
+        .panel-form { display: flex; gap: 15px; align-items: flex-end; }
+        .panel-form .form-group { flex-grow: 1; margin-bottom: 0; }
+        .actions-cell { display: flex; align-items: center; gap: 15px; }
+        .actions-cell form { display: inline; margin: 0; }
+        .actions-cell .btn-delete { background: none; border: none; color: var(--color-peligro); cursor: pointer; padding: 0; }
+        .flash-message { padding: 1em; margin-bottom: 1em; border-radius: 5px; color: white; font-weight: bold; }
+        .flash-success { background-color: var(--color-exito); }
+        .flash-error { background-color: var(--color-peligro); }
+        .upload-section { margin-top: 2em; padding: 1.5em; border: 1px dashed #6c757d; border-radius: 8px; background-color: #f8f9fa; }
+        .upload-section form { display: flex; align-items: center; gap: 15px; }
+        .upload-section button { font-size: 1em; }
+        .desvincular-section { border-color: var(--color-peligro); }
+        .desvincular-section button { background-color: var(--color-peligro); }
+        .value-select { display: none; }
+        .module { margin-bottom: 1.5em; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden; }
+        .module-header { background-color: var(--color-fondo); padding: 12px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+        .module-header h2 { margin: 0; border: none; padding: 0; font-size: 1.2em; }
+        .module-header .toggle-icon { font-size: 1.5em; font-weight: bold; transition: transform 0.3s; }
+        .module-content { padding: 20px; border-top: 1px solid #dee2e6; }
+        .module-content.collapsed { display: none; }
+        .main-action-panel { padding: 1.5em; background-color: var(--color-primario); border-radius: 8px; text-align: center; margin-bottom: 2em; }
+        .main-action-panel .btn-principal { background-color: white; color: var(--color-primario); font-size: 1.2em; }
+        .pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 2em; }
+        .pagination a, .pagination span { padding: 8px 15px; border-radius: 5px; text-decoration: none; }
+        .pagination a { background-color: var(--color-primario); color: white; }
+        .pagination a:hover { background-color: #0b5ed7; }
+        .pagination span.disabled { color: #999; background-color: #e9ecef; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash-message flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <h1>Control de Asistencia y Personal</h1>     
+    <div class="main-action-panel" style="display: flex; justify-content: center; gap: 20px;">
+    <a href="{{ url_for('registrar_asistencia') }}" class="btn btn-principal">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M11 6.5a.5.5 0 0 1 .5-.5h1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-1zm-3 0a.5.5 0 0 1 .5-.5h1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-1zm-3 0a.5.5 0 0 1 .5-.5h1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-1zm-3 0a.5.5 0 0 1 .5-.5h1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-1z"/><path d="M3.5 0a.5.5 0 0 1 .5.5V1h8V.5a.5.5 0 0 1 1 0V1h1a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2h1V.5a.5.5 0 0 1 .5-.5zM1 4v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V4H1z"/></svg>
+        Ir a Registro de Asistencia
+    </a>
+    <a href="{{ url_for('reportes') }}" class="btn btn-principal">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M11 2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v12h.5a.5.5 0 0 1 0 1H.5a.5.5 0 0 1 0-1H1v-3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v3h1V7a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v7h1V2zm1 12h2V2h-2v12zm-3 0V7H7v7h2zm-4 0v-3H2v3h2z"/></svg>
+        Módulo de Reportes
+    </a>
+    <a href="{{ url_for('gestion_turnos') }}" class="btn btn-principal">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+            <path d="M4 .5a.5.5 0 0 0-1 0V1H2a2 2 0 0 0-2 2v1h16V3a2 2 0 0 0-2-2h-1V.5a.5.5 0 0 0-1 0V1H4V.5zM16 14V5H0v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2z"/>
+        </svg>
+        Gestión de Turnos
+    </a>
+</div>
+        <div class="module">
+            <div class="module-header" data-module="registrar_empleado"><h2>Registrar Nuevo Empleado</h2><span class="toggle-icon">+</span></div>
+            <div class="module-content collapsed" id="registrar_empleado">
+                <form action="{{ url_for('agregar_empleado') }}" method="post" class="form-registro" id="registro-form">
+                    <div class="form-group"> <label for="rut">RUT / Pasaporte:</label> <input type="text" id="rut" name="rut" required> </div>
+                    <div class="form-group"> <label for="nombre_completo">Nombre Completo:</label> <input type="text" id="nombre_completo" name="nombre_completo" required> </div>
+                    <div class="form-group"> <label for="fecha_nacimiento">Fecha de Nacimiento:</label> <input type="date" id="fecha_nacimiento" name="fecha_nacimiento"> </div>
+                    <div class="form-group"> <label for="edad_calculada">Edad (calculada):</label> <input type="text" id="edad_calculada" readonly> </div>
+                    <div class="form-group"> <label for="telefono">Teléfono:</label> <input type="tel" id="telefono" name="telefono"> </div>
+                    <div class="form-group"> <label for="correo_electronico">Correo Electrónico:</label> <input type="email" id="correo_electronico" name="correo_electronico"> </div>
+                    <div class="form-group" style="grid-column: 1 / -1;"> <label for="direccion">Dirección:</label> <input type="text" id="direccion" name="direccion"> </div>
+                    <div class="form-group"> <label for="genero_id">Género:</label> <select id="genero_id" name="genero_id"> {% for item in generos %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="nacionalidad_id">Nacionalidad:</label> <select id="nacionalidad_id" name="nacionalidad_id"> {% for nac in nacionalidades %}<option value="{{ nac.id }}">{{ nac.pais }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="id_sap_global">ID SAP Global:</label> <input type="text" id="id_sap_global" name="id_sap_global"> </div>
+                    <div class="form-group"> <label for="id_sap_local">ID SAP Local:</label> <input type="text" id="id_sap_local" name="id_sap_local"> </div>
+                    <div class="form-group"> <label for="nomina_id">Nómina:</label> <select id="nomina_id" name="nomina_id"> {% for item in nominas %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="fecha_ingreso">Fecha de Ingreso:</label> <input type="date" id="fecha_ingreso" name="fecha_ingreso" required> </div>
+                    <div class="form-group"> <label for="tipo_contrato_id">Tipo de Contrato:</label> <select id="tipo_contrato_id" name="tipo_contrato_id"> {% for item in tipos_contrato %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="relacion_laboral_id">Relación Laboral:</label> <select id="relacion_laboral_id" name="relacion_laboral_id"> {% for item in relaciones_laborales %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="area_id">Área:</label> <select id="area_id" name="area_id"> {% for item in areas %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="cargo_id">Cargo:</label> <select id="cargo_id" name="cargo_id" required> <option value="">-- Seleccione un cargo --</option> {% for cargo in cargos %}<option value="{{ cargo.id }}">{{ cargo.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="supervision_id">Supervisión:</label> <select id="supervision_id" name="supervision_id"> {% for item in supervisiones %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="turno_id">Turno:</label> <select id="turno_id" name="turno_id" required> <option value="">-- Seleccione un turno --</option> {% for turno in turnos %}<option value="{{ turno.id }}">{{ turno.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="fase_id">Fase:</label> <select id="fase_id" name="fase_id"> {% for item in fases %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="distribucion_categoria_id">Distribución Categoría:</label> <select id="distribucion_categoria_id" name="distribucion_categoria_id"> {% for item in distribucion_categorias %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="region_id">Región:</label> <select id="region_id" name="region_id" required> <option value="">-- Seleccione una región --</option> {% for region in regiones %}<option value="{{ region.id }}">{{ region.region }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="comuna_id">Comuna:</label> <select id="comuna_id" name="comuna_id" required disabled> <option value="">-- Primero elija una región --</option> </select> </div>
+                    <div class="form-group"> <label for="tipo_pasaje_id">Tipo de Pasaje (automático):</label> <select id="tipo_pasaje_id" name="tipo_pasaje_id"> {% for item in tipos_pasaje %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <hr>
+                    <div class="form-group"> <label for="acreditacion_id">Acreditación:</label> <select id="acreditacion_id" name="acreditacion_id"> {% for item in acreditaciones %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group"> <label for="status_id">Status:</label> <select id="status_id" name="status_id"> {% for item in status_empleado %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                    <div class="form-group" style="grid-column: 1 / -1;"> <button type="submit" id="guardar-btn" class="btn btn-success">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M.05 3.555A2 2 0 0 1 2 2h12a2 2 0 0 1 1.95 1.555L8 8.414.05 3.555ZM0 4.697v7.104l5.803-3.558L0 4.697ZM6.761 8.83l-6.57 4.027A2 2 0 0 0 2 14h12a2 2 0 0 0 1.808-1.144l-6.57-4.027L8 9.586l-1.239-.757Zm3.436-.586L16 11.801V4.697l-5.803 3.546Z"/></svg>
+                        Guardar Nuevo Empleado
+                    </button> </div>
+                </form>
+            </div>
+        </div>
+        
+        <div class="module">
+            <div class="module-header" data-module="herramientas_masivas"><h2>Herramientas Masivas</h2><span class="toggle-icon">+</span></div>
+            <div class="module-content collapsed" id="herramientas_masivas">
+                <div class="panel">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                        <div class="upload-section">
+                            <p><strong>Carga de Nuevos Empleados</strong><br>Sube un archivo Excel (.xlsx) para registrar empleados masivamente.</p>
+                            <form action="{{ url_for('upload_empleados') }}" method="post" enctype="multipart/form-data"> <input type="file" name="archivo_excel" accept=".xlsx" required> <button type="submit" class="btn btn-success">Subir</button> </form>
+                        </div>
+                        <div class="upload-section desvincular-section">
+                            <p><strong>Actualización de Desvinculaciones</strong><br>Sube un Excel con: rut, id_sap_local, fecha_egreso, causal_despido_id.</p>
+                            <form action="{{ url_for('upload_desvinculaciones') }}" method="post" enctype="multipart/form-data"> <input type="file" name="archivo_excel" accept=".xlsx" required> <button type="submit" class="btn btn-danger">Desvincular</button> </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="module">
+            <div class="module-header" data-module="empleados_registrados"><h2>Empleados Registrados</h2><span class="toggle-icon">+</span></div>
+            <div class="module-content collapsed" id="empleados_registrados">
+                <div class="panel">
+                    <form action="{{ url_for('index') }}" method="get" class="panel-form">
+                        <input type="hidden" name="active_modules" class="active-modules-input" value="{{ active_modules }}">
+                        <div class="form-group"> <label for="search_by">Buscar por:</label> <select name="search_by" id="search_by"> <option value="rut" {% if search_by == 'rut' %}selected{% endif %}>RUT</option> <option value="id_sap_local" {% if search_by == 'id_sap_local' %}selected{% endif %}>ID SAP Local</option> </select> </div>
+                        <div class="form-group"> <label for="query">Ingresa uno o varios términos:</label> <textarea name="query" id="query" rows="1" placeholder="Pega una lista separada por comas, espacios o saltos de línea.">{{ query or '' }}</textarea> </div>
+                        <button type="submit" class="btn btn-primary" style="height: 45px;">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/></svg>
+                            Buscar
+                        </button>
+                    </form>
+                </div>
+                
+                <form id="bulk-form" action="{{ url_for('editar_masivo') }}" method="post">
+                    <input type="hidden" name="active_modules" class="active-modules-input" value="{{ active_modules }}">
+                    <input type="hidden" name="query" value="{{ query or '' }}">
+                    <input type="hidden" name="search_by" value="{{ search_by or '' }}">
+                    <div class="panel" style="flex-direction: row; display: flex; gap: 15px; align-items: flex-end;">
+                        <div class="form-group"> <label for="accion">Acción para seleccionados:</label> <select name="accion" id="accion" required> <option value="">-- Elegir acción --</option> <optgroup label="Actualizar Campo"> <option value="area_id">Cambiar Área</option> <option value="turno_id">Cambiar Turno</option> <option value="status_id">Cambiar Status</option> <option value="acreditacion_id">Cambiar Acreditación</option><option value="nomina_id">Cambiar Nómina</option> </optgroup> <optgroup label="Planificar Asistencia por Rango"> {% for codigo in codigos_asistencia %} <option value="planificar-{{ codigo.codigo }}">Asignar "{{ codigo.descripcion }}"</option> {% endfor %} </optgroup> <optgroup label="Administrar"> <option value="eliminar" style="color:red; font-weight:bold;">ELIMINAR SELECCIONADOS</option> </optgroup> </select> </div>
+                        <div class="form-group" id="valor-container" style="display: none;"> <label>Nuevo valor:</label> <select name="nuevo_valor_area_id" id="select_area_id" class="value-select"> {% for item in areas %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> <select name="nuevo_valor_turno_id" id="select_turno_id" class="value-select"> {% for item in turnos %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> <select name="nuevo_valor_status_id" id="select_status_id" class="value-select"> {% for item in status_empleado %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> <select name="nuevo_valor_acreditacion_id" id="select_acreditacion_id" class="value-select"> {% for item in acreditaciones %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> <select name="nuevo_valor_nomina_id" id="select_nomina_id" class="value-select"> {% for item in nominas %}<option value="{{ item.id }}">{{ item.nombre }}</option>{% endfor %} </select> </div>
+                        <div class="form-group" id="fecha-container" style="display: none; flex-direction: row; gap: 10px;"> <div><label for="fecha_inicio">Desde:</label><input type="date" name="fecha_inicio" id="fecha_inicio"></div> <div><label for="fecha_fin">Hasta:</label><input type="date" name="fecha_fin" id="fecha_fin"></div> </div>
+                        <button type="submit" class="btn btn-warning">Aplicar</button>
+                    </div>
+                    <table>
+                        <thead> <tr> <th><input type="checkbox" id="select-all"></th> <th>RUT</th> <th>Nombre</th> <th>Cargo</th> <th>Área</th> <th>Status</th> <th>Acciones</th> </tr> </thead>
+                        <tbody>
+                            {% for empleado in empleados %}
+                            <tr>
+                                <td><input type="checkbox" name="empleado_ids" value="{{ empleado.id }}" class="employee-checkbox"></td>
+                                <td>{{ empleado.rut }}</td>
+                                <td>{{ empleado.nombre_completo }}</td>
+                                <td>{{ empleado.cargo_nombre }}</td>
+                                <td>{{ empleado.area_nombre }}</td>
+                                <td>{{ empleado.status_nombre }}</td>
+                                <td class="actions-cell">
+                                    <a href="{{ url_for('editar_empleado', id=empleado.id, query=query, search_by=search_by, active_modules=active_modules) }}" class="btn-edit">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M12.854.146a.5.5 0 0 0-.707 0L10.5 1.793 14.207 5.5l1.647-1.646a.5.5 0 0 0 0-.708l-3-3zm.646 6.061L9.793 2.5 3.293 9H3.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.207l6.5-6.5zm-7.468 7.468A.5.5 0 0 1 6 13.5V13h-.5a.5.5 0 0 1-.5-.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.5-.5V10h-.5a.499.499 0 0 1-.175-.032l-.179.178a.5.5 0 0 0-.11.168l-2 5a.5.5 0 0 0 .65.65l5-2a.5.5 0 0 0 .168-.11l.178-.178z"/></svg>
+                                        Editar
+                                    </a>
+                                    <form action="{{ url_for('eliminar_empleado', id=empleado.id) }}" method="post">
+                                        <button type="submit" class="btn-delete" onclick="return confirm('¿Estás seguro de que quieres eliminar a este empleado?');">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/></svg>
+                                            Eliminar
+                                        </button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr> <td colspan="8" style="text-align: center;">No se encontraron empleados que coincidan con la búsqueda.</td> </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </form>
+                
+                {% if not query and total_pages > 1 %}
+                <div class="pagination">
+                    {% if page > 1 %}
+                        <a href="{{ url_for('index', page=page-1, active_modules=active_modules) }}">Anterior</a>
+                    {% else %}
+                        <span class="disabled">Anterior</span>
+                    {% endif %}
+                    <span>Página {{ page }} de {{ total_pages }}</span>
+                    {% if page < total_pages %}
+                        <a href="{{ url_for('index', page=page+1, active_modules=active_modules) }}">Siguiente</a>
+                    {% else %}
+                        <span class="disabled">Siguiente</span>
+                    {% endif %}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const regionSelect = document.getElementById('region_id');
+            const comunaSelect = document.getElementById('comuna_id');
+            const fechaNacimientoInput = document.getElementById('fecha_nacimiento');
+            const edadDisplay = document.getElementById('edad_calculada');
+            const tipoPasajeSelect = document.getElementById('tipo_pasaje_id');
+            const selectAllCheckbox = document.getElementById('select-all');
+            const employeeCheckboxes = document.querySelectorAll('.employee-checkbox');
+            const accionSelect = document.getElementById('accion');
+            const valorContainer = document.getElementById('valor-container');
+            const valueSelects = valorContainer.querySelectorAll('.value-select');
+            const fechaContainer = document.getElementById('fecha-container');
+            const fechaInicioInput = document.getElementById('fecha_inicio');
+            const fechaFinInput = document.getElementById('fecha_fin');
+            const bulkForm = document.getElementById('bulk-form');
+            const registroForm = document.getElementById('registro-form');
+
+            if (regionSelect) {
+                regionSelect.addEventListener('change', function() {
+                    if(tipoPasajeSelect) actualizarTipoPasaje();
+                    const regionId = this.value;
+                    comunaSelect.innerHTML = '<option value="">Cargando...</option>';
+                    comunaSelect.disabled = true;
+                    if (!regionId) { comunaSelect.innerHTML = '<option value="">-- Primero elija una región --</option>'; return; }
+                    fetch(`/get_comunas/${regionId}`).then(response => response.json()).then(data => {
+                        comunaSelect.innerHTML = '<option value="">-- Seleccione una comuna --</option>';
+                        data.forEach(function(comuna) {
+                            const option = document.createElement('option');
+                            option.value = comuna.id;
+                            option.textContent = comuna.comuna;
+                            comunaSelect.appendChild(option);
+                        });
+                        comunaSelect.disabled = false;
+                    });
+                });
+            }
+
+            if (fechaNacimientoInput) {
+                function calcularEdad() {
+                    if (!fechaNacimientoInput.value) { edadDisplay.value = ''; return; }
+                    const hoy = new Date();
+                    const nacimiento = new Date(fechaNacimientoInput.value);
+                    let edad = hoy.getFullYear() - nacimiento.getFullYear();
+                    const m = hoy.getMonth() - nacimiento.getMonth();
+                    if (m < 0 || (m === 0 && hoy.getDate() < nacimiento.getDate())) { edad--; }
+                    edadDisplay.value = edad >= 0 ? `${edad} años` : '';
+                }
+                fechaNacimientoInput.addEventListener('change', calcularEdad);
+                calcularEdad();
+            }
+
+            function actualizarTipoPasaje() {
+                const regionId = parseInt(regionSelect.value, 10);
+                let pasajeId;
+                if (regionId >= 6 && regionId <= 16) { pasajeId = 1; }
+                else if (regionId >= 1 && regionId <= 5) { pasajeId = 2; }
+                else { pasajeId = 3; }
+                if(tipoPasajeSelect) tipoPasajeSelect.value = pasajeId;
+            }
+
+            if (selectAllCheckbox) {
+                selectAllCheckbox.addEventListener('change', function() {
+                    employeeCheckboxes.forEach(checkbox => { checkbox.checked = this.checked; });
+                });
+            }
+
+            if (accionSelect) {
+                accionSelect.addEventListener('change', function() {
+                    const selectedAction = this.value;
+                    valorContainer.style.display = 'none';
+                    valueSelects.forEach(s => s.style.display = 'none');
+                    fechaContainer.style.display = 'none';
+                    fechaInicioInput.required = false;
+                    fechaFinInput.required = false;
+                    if (selectedAction.startsWith('planificar-')) {
+                        fechaContainer.style.display = 'flex';
+                        fechaInicioInput.required = true;
+                        fechaFinInput.required = true;
+                    } else if (selectedAction && selectedAction !== 'eliminar') {
+                        valorContainer.style.display = 'block';
+                        const selectedValueSelect = document.getElementById('select_' + selectedAction);
+                        if (selectedValueSelect) { selectedValueSelect.style.display = 'block'; }
+                    }
+                });
+            }
+
+            if (bulkForm) {
+                bulkForm.addEventListener('submit', function(event) {
+                    if (accionSelect.value === 'eliminar' || accionSelect.value.startsWith('planificar-')) {
+                        const checkedCheckboxes = document.querySelectorAll('.employee-checkbox:checked');
+                        if (checkedCheckboxes.length === 0) {
+                            alert('Por favor, selecciona al menos un empleado.');
+                            event.preventDefault(); return;
+                        }
+                        if (accionSelect.value === 'eliminar') {
+                            const confirmation = confirm(`¿Estás seguro de que quieres eliminar los ${checkedCheckboxes.length} empleados seleccionados? Esta acción no se puede deshacer.`);
+                            if (!confirmation) { event.preventDefault(); }
+                        }
+                    }
+                });
+            }
+
+            if (registroForm) {
+                registroForm.addEventListener('submit', function() {
+                    const guardarBtn = document.getElementById('guardar-btn');
+                    if (guardarBtn) {
+                        guardarBtn.disabled = true;
+                        guardarBtn.innerHTML = 'Guardando...';
+                    }
+                });
+            }
+            
+            const activeModules = '{{ active_modules or "" }}'.split(',');
+            document.querySelectorAll('.module').forEach(module => {
+                const header = module.querySelector('.module-header');
+                const content = module.querySelector('.module-content');
+                const icon = header.querySelector('.toggle-icon');
+                const moduleName = header.dataset.module;
+
+                const updateModuleState = (isOpen) => {
+                    if (isOpen) {
+                        content.classList.remove('collapsed');
+                        icon.textContent = '-';
+                    } else {
+                        content.classList.add('collapsed');
+                        icon.textContent = '+';
+                    }
+                };
+
+                updateModuleState(activeModules.includes(moduleName));
+
+                header.addEventListener('click', () => {
+                    const isOpen = content.classList.contains('collapsed');
+                    updateModuleState(isOpen);
+                    
+                    let currentActive = Array.from(document.querySelectorAll('.module-content:not(.collapsed)'))
+                                           .map(el => el.id);
+                    document.querySelectorAll('.active-modules-input').forEach(input => {
+                        input.value = currentActive.join(',');
+                    });
+                });
+            });
+        });
+    </script>
+</body>
+</html>

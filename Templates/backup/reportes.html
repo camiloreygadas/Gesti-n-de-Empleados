@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Módulo de Reportes</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --color-primario: #0d6efd;
+            --color-secundario: #6c757d;
+            --color-exito: #198754;
+            --color-peligro: #dc3545;
+            --color-advertencia: #ffc107;
+            --color-info: #0dcaf0;
+            --color-fondo: #f8f9fa;
+            --color-superficie: #ffffff;
+            --sombra-suave: 0 4px 8px rgba(0,0,0,0.05);
+        }
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: var(--color-fondo); color: #333; }
+        .container { max-width: 1600px; margin: 2em auto; padding: 2em; background-color: var(--color-superficie); border-radius: 12px; box-shadow: var(--sombra-suave); }
+        h1, h2 { color: #333; border-bottom: 1px solid #dee2e6; padding-bottom: 10px; }
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: 500; text-decoration: none; transition: all 0.2s ease; }
+        .btn-primary { background-color: var(--color-primario); color: white; }
+        .btn-info { background-color: var(--color-info); color: white; }
+        .btn-info:hover { background-color: #0aa2c0; }
+        a.back-link { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 2em; color: var(--color-primario); text-decoration: none; font-weight: 500; }
+        .panel { margin-bottom: 2em; padding: 1.5em; background-color: var(--color-fondo); border-radius: 8px; }
+        .panel-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; align-items: flex-end; }
+        .form-group { display: flex; flex-direction: column; }
+        label { margin-bottom: 0.5em; font-weight: 500; font-size: 0.9em; color: #555; }
+        input, select { padding: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 1em; }
+        .report-header { display: flex; justify-content: space-between; align-items: center; margin-top: 2em; }
+        .report-container { margin-top: 1em; overflow-x: auto; }
+        .report-table { width: 100%; border-collapse: collapse; }
+        .report-table th, .report-table td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        .report-table thead { background-color: #e9ecef; }
+        .report-table tbody tr:nth-child(even) { background-color: #f9f9f9; }
+        .total-row { background-color: #e9ecef; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="{{ url_for('index') }}" class="back-link">&larr; Volver a Gestión Principal</a>
+        <h1>Módulo de Reportes</h1>
+        <div class="panel">
+            <form method="POST" action="{{ url_for('reportes') }}" class="panel-form">
+                <div class="form-group">
+                    <label for="report_type">Tipo de Reporte</label>
+                    <select name="report_type" id="report_type" required>
+                        <option value="general_asistencia" {% if filters and filters.report_type == 'general_asistencia' %}selected{% endif %}>Reporte General de Asistencia</option>
+                        <option value="ausentismo_especifico" {% if filters and filters.report_type == 'ausentismo_especifico' %}selected{% endif %}>Reporte de Ausentismo (F, PNP, LM, MUT)</option>
+                        <option value="calculo_horas" {% if filters and filters.report_type == 'calculo_horas' %}selected{% endif %}>Reporte de Cálculo de Horas</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="date_from">Desde</label>
+                    <input type="date" name="date_from" id="date_from" value="{{ filters.date_from if filters else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="date_to">Hasta</label>
+                    <input type="date" name="date_to" id="date_to" value="{{ filters.date_to if filters else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="area_id">Área (Opcional)</label>
+                    <select name="area_id" id="area_id">
+                        <option value="">Todas las áreas</option>
+                        {% for area in areas %}
+                        <option value="{{ area.id }}" {% if filters and filters.area_id == area.id|string %}selected{% endif %}>{{ area.nombre }}</option>
+                        {% endfor %}
+                    </select>
+                    <div class="form-group">
+                    <label for="codigo_filtro">Filtrar por Evento (Opcional)</label>
+                    <select name="codigo_filtro" id="codigo_filtro">
+                        <option value="">Todos los eventos</option>
+                        <optgroup label="Presentismo">
+                            <option value="T" {% if filters and filters.codigo_filtro == 'T' %}selected{% endif %}>Trabajado (T)</option>
+                        </optgroup>
+                        <optgroup label="Ausentismo">
+                            <option value="F" {% if filters and filters.codigo_filtro == 'F' %}selected{% endif %}>Falla (F)</option>
+                            <option value="PNP" {% if filters and filters.codigo_filtro == 'PNP' %}selected{% endif %}>Permiso No Pagado (PNP)</option>
+                            <option value="LM" {% if filters and filters.codigo_filtro == 'LM' %}selected{% endif %}>Licencia Médica (LM)</option>
+                            <option value="MUT" {% if filters and filters.codigo_filtro == 'MUT' %}selected{% endif %}>Mutual (MUT)</option>
+                        </optgroup>
+                        <optgroup label="Permisos Pagados y Vacaciones">
+                            <option value="V" {% if filters and filters.codigo_filtro == 'V' %}selected{% endif %}>Vacaciones (V)</option>
+                            <option value="PP" {% if filters and filters.codigo_filtro == 'PP' %}selected{% endif %}>Permiso Pagado (PP)</option>
+                            <option value="PSN" {% if filters and filters.codigo_filtro == 'PSN' %}selected{% endif %}>Permiso Post Natal (PSN)</option>
+                            <option value="PF" {% if filters and filters.codigo_filtro == 'PF' %}selected{% endif %}>Permiso Fallecimiento (PF)</option>
+                        </optgroup>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Generar Reporte</button>
+                </div>
+                </div>
+                <div class="form-group">
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Generar Reporte</button>
+                </div>
+            </form>
+        </div>
+
+        {% if report_data %}
+        <div class="report-header">
+            <h2>{{ report_title }} <small style="color: #6c757d; font-weight: normal;">(Desde {{ filters.date_from }} hasta {{ filters.date_to }})</small></h2>
+            <a href="{{ url_for('exportar_reporte') }}" class="btn btn-info">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/></svg>
+                Exportar a Excel
+            </a>
+        </div>
+        <div class="report-container">
+            {{ report_html | safe }}
+        </div>
+        {% endif %}
+
+    </div>
+</body>
+</html>

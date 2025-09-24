@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestión de Empleados</title>
+    <!-- Bootstrap 5.3 -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            /* Colores modo claro */
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-tertiary: #e9ecef;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --text-muted: #adb5bd;
+            --border-color: #dee2e6;
+            --accent-color: #0d6efd;
+            --success-color: #198754;
+            --danger-color: #dc3545;
+            --warning-color: #fd7e14;
+            --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            --shadow-lg: 0 1rem 3rem rgba(0, 0, 0, 0.175);
+            --gradient-bg: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --card-hover: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+        }
+
+        [data-bs-theme="dark"] {
+            /* Colores modo oscuro */
+            --bg-primary: #212529;
+            --bg-secondary: #343a40;
+            --bg-tertiary: #495057;
+            --text-primary: #ffffff;
+            --text-secondary: #adb5bd;
+            --text-muted: #6c757d;
+            --border-color: #495057;
+            --accent-color: #0d6efd;
+            --success-color: #198754;
+            --danger-color: #dc3545;
+            --warning-color: #fd7e14;
+            --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.3);
+            --shadow-lg: 0 1rem 3rem rgba(0, 0, 0, 0.5);
+            --gradient-bg: linear-gradient(135deg, #434343 0%, #000000 100%);
+            --card-hover: 0 0.5rem 1rem rgba(0, 0, 0, 0.5);
+        }
+
+        * {
+            transition: all 0.3s ease;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        /* Header mejorado */
+        .header-gradient {
+            background: var(--gradient-bg);
+            padding: 2rem 0;
+            margin-bottom: 2rem;
+            border-radius: 0 0 1rem 1rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header-gradient::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(45deg, transparent 40%, rgba(255,255,255,0.1) 50%, transparent 60%);
+            animation: shimmer 3s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .header-title {
+            color: white;
+            font-weight: 700;
+            font-size: 2.5rem;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            margin: 0;
+        }
+
+        /* Theme Toggle */
+        .theme-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1050;
+            background: var(--bg-primary);
+            border: 2px solid var(--border-color);
+            border-radius: 50px;
+            padding: 0.5rem 1rem;
+            box-shadow: var(--shadow-lg);
+            transition: all 0.3s ease;
+        }
+
+        .theme-toggle:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--card-hover);
+        }
+
+        .theme-toggle-btn {
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 1.2rem;
+            cursor: pointer;
+            padding: 0.25rem 0.5rem;
+            border-radius: 25px;
+            transition: all 0.3s ease;
+        }
+
+        .theme-toggle-btn:hover {
+            background: var(--bg-tertiary);
+            transform: scale(1.1);
+        }
+
+        /* Cards mejoradas */
+        .card {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            box-shadow: var(--shadow);
+            transition: all 0.3s ease;
+            margin-bottom: 1.5rem;
+        }
+
+        .card:hover {
+            box-shadow: var(--card-hover);
+            transform: translateY(-2px);
+        }
+
+        .card-header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            border-radius: 1rem 1rem 0 0 !important;
+            padding: 1.5rem;
+        }
+
+        .card-body {
+            padding: 2rem;
+        }
+
+        /* Navegación mejorada */
+        .nav-tabs {
+            border: none;
+            background: var(--bg-primary);
+            border-radius: 1rem 1rem 0 0;
+            padding: 1rem 1rem 0;
+            margin-bottom: 0;
+        }
+
+        .nav-tabs .nav-link {
+            background: transparent;
+            border: none;
+            border-radius: 0.75rem 0.75rem 0 0;
+            padding: 1rem 2rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+            transition: all 0.3s ease;
+            position: relative;
+            margin-right: 0.5rem;
+        }
+
+        .nav-tabs .nav-link:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            transform: translateY(-2px);
+        }
+
+        .nav-tabs .nav-link.active {
+            background: var(--accent-color);
+            color: white;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .nav-tabs .nav-link.active::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: var(--accent-color);
+            border-radius: 0 0 3px 3px;
+        }
+
+        /* Formularios mejorados */
+        .form-control, .form-select {
+            background: var(--bg-primary);
+            border: 2px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 0.875rem 1rem;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.1);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            transform: translateY(-1px);
+        }
+
+        .form-label {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.75rem;
+            font-size: 0.9rem;
+        }
+
+        /* Botones mejorados */
+        .btn {
+            border-radius: 0.75rem;
+            padding: 0.75rem 1.5rem;
+            font-weight: 500;
+            font-size: 0.95rem;
+            border: none;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+
+        .btn:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--card-hover);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        /* Botones de navegación principal */
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            color: var(--accent-color);
+            font-weight: 600;
+            margin: 0.5rem;
+            min-width: 200px;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            transition: all 0.3s ease;
+        }
+
+        .nav-btn:hover {
+            background: var(--accent-color);
+            color: white;
+            transform: translateY(-3px) scale(1.02);
+            box-shadow: var(--card-hover);
+        }
+
+        /* Tabla mejorada */
+        .table {
+            background: var(--bg-primary);
+            border-radius: 1rem;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        .table th {
+            background: var(--bg-tertiary);
+            border: none;
+            padding: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .table td {
+            border: none;
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.25rem;
+            vertical-align: middle;
+            color: var(--text-primary);
+        }
+
+        .table tbody tr {
+            transition: all 0.3s ease;
+        }
+
+        .table tbody tr:hover {
+            background: var(--bg-secondary);
+            transform: scale(1.005);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        /* Campos clickeables mejorados */
+        .clickable-field {
+            cursor: pointer;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            transition: all 0.3s ease;
+            display: inline-block;
+            position: relative;
+        }
+
+        .clickable-field:hover {
+            background: var(--accent-color);
+            color: white;
+            transform: scale(1.05);
+            text-decoration: none;
+        }
+
+        .clickable-field.selected {
+            background: var(--success-color);
+            color: white;
+            box-shadow: 0 0 0 3px rgba(25, 135, 84, 0.2);
+        }
+
+        /* Badges mejorados */
+        .badge {
+            border-radius: 0.75rem;
+            padding: 0.5rem 1rem;
+            font-weight: 500;
+            font-size: 0.85rem;
+        }
+
+        /* Animaciones de carga */
+        .loading-skeleton {
+            background: linear-gradient(90deg, var(--bg-tertiary) 25%, var(--bg-secondary) 50%, var(--bg-tertiary) 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+        }
+
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        /* Selección mejorada */
+        .selection-controls {
+            background: var(--bg-primary);
+            border: 2px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .selection-display {
+            background: var(--accent-color);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 2rem;
+            font-weight: 600;
+            font-size: 1rem;
+            box-shadow: var(--shadow);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+
+        /* Paginación mejorada */
+        .pagination {
+            margin: 0;
+        }
+
+        .page-link {
+            background: var(--bg-primary);
+            border: 2px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.75rem 1rem;
+            margin: 0 0.25rem;
+            border-radius: 0.75rem;
+            transition: all 0.3s ease;
+        }
+
+        .page-link:hover {
+            background: var(--accent-color);
+            color: white;
+            border-color: var(--accent-color);
+            transform: translateY(-2px);
+        }
+
+        .page-item.active .page-link {
+            background: var(--accent-color);
+            border-color: var(--accent-color);
+            box-shadow: var(--shadow-lg);
+        }
+
+        /* Alertas mejoradas */
+        .alert {
+            border: none;
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .alert-info {
+            background: rgba(13, 202, 240, 0.1);
+            color: var(--text-primary);
+            border-left: 4px solid #0dcaf0;
+        }
+
+        /* Responsive mejoras */
+        @media (max-width: 768px) {
+            .header-title {
+                font-size: 1.8rem;
+            }
+            
+            .nav-btn {
+                min-width: auto;
+                margin: 0.25rem;
+                padding: 0.75rem 1rem;
+            }
+            
+            .card-body {
+                padding: 1rem;
+            }
+            
+            .table th, .table td {
+                padding: 0.75rem 0.5rem;
+            }
+            
+            .theme-toggle {
+                position: relative;
+                top: auto;
+                right: auto;
+                margin-bottom: 1rem;
+            }
+        }
+
+        /* Efectos especiales */
+        .floating-action {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: var(--accent-color);
+            color: white;
+            border: none;
+            font-size: 1.5rem;
+            box-shadow: var(--shadow-lg);
+            z-index: 1000;
+            transition: all 0.3s ease;
+        }
+
+        .floating-action:hover {
+            transform: scale(1.1) rotate(90deg);
+            background: var(--success-color);
+        }
+
+        /* Loading spinner */
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid var(--border-color);
+            border-top: 4px solid var(--accent-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body data-bs-theme="light">
+    <!-- Theme Toggle -->
+    <div class="theme-toggle">
+        <button class="theme-toggle-btn" onclick="toggleTheme()" title="Cambiar tema">
+            <i class="fas fa-moon" id="theme-icon"></i>
+        </button>
+    </div>
+
+    <!-- Header mejorado -->
+    <div class="header-gradient">
+        <div class="container text-center">
+            <h1 class="header-title">
+                <i class="fas fa-users me-3"></i>
+                Gestión de Empleados
+            </h1>
+            <p class="text-white-50 mb-0 fs-5">Sistema integral de administración de personal</p>
+        </div>
+    </div>
+
+    <div class="container-fluid px-4">
+        <!-- Navegación principal mejorada -->
+        <div class="card mb-4">
+            <div class="card-body text-center py-4">
+                <div class="row justify-content-center">
+                    <div class="col-auto">
+                        <a href="#" class="btn nav-btn">
+                            <i class="fas fa-calendar-check"></i>
+                            Registro de Asistencia
+                        </a>
+                    </div>
+                    <div class="col-auto">
+                        <a href="#" class="btn nav-btn">
+                            <i class="fas fa-chart-pie"></i>
+                            Módulo de Reportes
+                        </a>
+                    </div>
+                    <div class="col-auto">
+                        <a href="#" class="btn nav-btn">
+                            <i class="fas fa-calendar-days"></i>
+                            Gestión de Turnos
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tabs mejorados -->
+        <div class="card">
+            <ul class="nav nav-tabs" id="mainTabs">
+                <li class="nav-item">
+                    <button class="nav-link active" id="lista-tab" data-bs-toggle="tab" data-bs-target="#lista-pane">
+                        <i class="fas fa-list me-2"></i>Lista de Empleados
+                    </button>
+                </li>
+                <li class="nav-item">
+                    <button class="nav-link" id="registrar-tab" data-bs-toggle="tab" data-bs-target="#registrar-pane">
+                        <i class="fas fa-user-plus me-2"></i>Registrar Empleado
+                    </button>
+                </li>
+                <li class="nav-item">
+                    <button class="nav-link" id="herramientas-tab" data-bs-toggle="tab" data-bs-target="#herramientas-pane">
+                        <i class="fas fa-tools me-2"></i>Herramientas Masivas
+                    </button>
+                </li>
+            </ul>
+
+            <div class="tab-content">
+                <!-- Tab Lista de Empleados -->
+                <div class="tab-pane fade show active" id="lista-pane">
+                    <div class="card-body">
+                        <!-- Búsqueda mejorada -->
+                        <div class="card mb-4">
+                            <div class="card-header">
+                                <h5 class="mb-0">
+                                    <i class="fas fa-search me-2"></i>
+                                    Búsqueda de Empleados
+                                </h5>
+                            </div>
+                            <div class="card-body">
+                                <form class="row g-3">
+                                    <div class="col-md-8">
+                                        <label class="form-label">Buscar empleados</label>
+                                        <textarea 
+                                            class="form-control" 
+                                            rows="3" 
+                                            placeholder="Ingresa RUTs, IDs SAP o nombres separados por comas, espacios o saltos de línea..."
+                                        ></textarea>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label">Campo de búsqueda</label>
+                                        <select class="form-select">
+                                            <option value="rut">RUT</option>
+                                            <option value="id_sap">ID SAP Local</option>
+                                            <option value="nombre">Nombre</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label">&nbsp;</label>
+                                        <button type="submit" class="btn btn-primary w-100">
+                                            <i class="fas fa-search me-2"></i>Buscar
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+
+                        <!-- Controles de selección mejorados -->
+                        <div class="selection-controls">
+                            <div class="row align-items-center">
+                                <div class="col-md-8">
+                                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                                        <span class="text-muted fw-bold me-2">Selección rápida:</span>
+                                        <button type="button" class="btn btn-outline-primary btn-sm">
+                                            <i class="fas fa-check-square me-1"></i>Todos visibles
+                                        </button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm">
+                                            <i class="fas fa-square me-1"></i>Deseleccionar
+                                        </button>
+                                        <button type="button" class="btn btn-outline-info btn-sm">
+                                            <i class="fas fa-exchange-alt me-1"></i>Invertir
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="col-md-4 text-end">
+                                    <div class="selection-display" style="display: none;">
+                                        0 empleados seleccionados
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Acciones masivas -->
+                        <div class="card mb-4">
+                            <div class="card-body">
+                                <div class="row g-3 align-items-center">
+                                    <div class="col-md-3">
+                                        <select class="form-select">
+                                            <option value="">-- Acción para seleccionados --</option>
+                                            <optgroup label="Actualizar Campo">
+                                                <option value="area">Cambiar Área</option>
+                                                <option value="turno">Cambiar Turno</option>
+                                                <option value="status">Cambiar Status</option>
+                                            </optgroup>
+                                            <optgroup label="Planificar Asistencia">
+                                                <option value="vacaciones">Vacaciones</option>
+                                                <option value="licencia">Licencia Médica</option>
+                                                <option value="permiso">Permiso</option>
+                                            </optgroup>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <select class="form-select" style="display: none;">
+                                            <option>Área 1</option>
+                                            <option>Área 2</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="d-flex gap-2" style="display: none;">
+                                            <input type="date" class="form-control" placeholder="Desde">
+                                            <input type="date" class="form-control" placeholder="Hasta">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <button type="button" class="btn btn-warning w-100">
+                                            <i class="fas fa-bolt me-1"></i>Aplicar
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tabla mejorada -->
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th width="50">
+                                            <input type="checkbox" class="form-check-input">
+                                        </th>
+                                        <th>RUT</th>
+                                        <th>Nombre Completo</th>
+                                        <th>ID SAP</th>
+                                        <th>Teléfono</th>
+                                        <th>Cargo</th>
+                                        <th>Área</th>
+                                        <th>Status</th>
+                                        <th width="120">Acciones</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- Datos de ejemplo -->
+                                    <tr>
+                                        <td>
+                                            <input type="checkbox" class="form-check-input">
+                                        </td>
+                                        <td>
+                                            <span class="clickable-field" data-bs-toggle="tooltip" title="Clic para seleccionar">
+                                                12.345.678-9
+                                            </span>
+                                        </td>
+                                        <td>Juan Pérez González</td>
+                                        <td>
+                                            <span class="badge bg-info-subtle text-info-emphasis clickable-field">
+                                                SAP001
+                                            </span>
+                                        </td>
+                                        <td>+56 9 8765 4321</td>
+                                        <td>Operador</td>
+                                        <td>Producción</td>
+                                        <td>
+                                            <span class="badge bg-success">Vigente</span>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-1">
+                                                <button class="btn btn-outline-primary btn-sm" title="Editar">
+                                                    <i class="fas fa-pencil-alt"></i>
+                                                </button>
+                                                <button class="btn btn-outline-danger btn-sm" title="Eliminar">
+                                                    <i class="fas fa-trash-alt"></i>
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>
+                                            <input type="checkbox" class="form-check-input">
+                                        </td>
+                                        <td>
+                                            <span class="clickable-field">
+                                                98.765.432-1
+                                            </span>
+                                        </td>
+                                        <td>María Silva Torres</td>
+                                        <td>
+                                            <span class="badge bg-info-subtle text-info-emphasis clickable-field">
+                                                SAP002
+                                            </span>
+                                        </td>
+                                        <td>+56 9 1234 5678</td>
+                                        <td>Supervisora</td>
+                                        <td>Calidad</td>
+                                        <td>
+                                            <span class="badge bg-success">Vigente</span>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-1">
+                                                <button class="btn btn-outline-primary btn-sm" title="Editar">
+                                                    <i class="fas fa-pencil-alt"></i>
+                                                </button>
+                                                <button class="btn btn-outline-danger btn-sm" title="Eliminar">
+                                                    <i class="fas fa-trash-alt"></i>
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- Paginación mejorada -->
+                        <div class="d-flex justify-content-between align-items-center mt-4">
+                            <div class="text-muted">
+                                Mostrando 1 - 20 de 150 empleados
+                            </div>
+                            <nav>
+                                <ul class="pagination">
+                                    <li class="page-item disabled">
+                                        <span class="page-link">
+                                            <i class="fas fa-chevron-left"></i>
+                                        </span>
+                                    </li>
+                                    <li class="page-item active">
+                                        <span class="page-link">1</span>
+                                    </li>
+                                    <li class="page-item">
+                                        <a class="page-link" href="#">2</a>
+                                    </li>
+                                    <li class="page-item">
+                                        <a class="page-link" href="#">3</a>
+                                    </li>
+                                    <li class="page-item">
+                                        <a class="page-link" href="#">
+                                            <i class="fas fa-chevron-right"></i>
+                                        </a>
+                                    </li>
+                                </ul>
+                            </nav>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab Registrar Empleado -->
+                <div class="tab-pane fade" id="registrar-pane">
+                    <div class="card-body">
+                        <form class="row g-4">
+                            <!-- Información Personal -->
+                            <div class="col-12">
+                                <h5 class="border-bottom pb-3 mb-4">
+                                    <i class="fas fa-user me-2"></i>
+                                    Información Personal
+                                </h5>
+                            </div>
+                            
+                            <div class="col-md-3">
+                                <label class="form-label">RUT / Pasaporte</label>
+                                <input type="text" class="form-control" required>
+                            </div>
+                            
+                            <div class="col-md-5">
+                                <label class="form-label">Nombre Completo</label>
+                                <input type="text" class="form-control" required>
+                            </div>
+                            
+                            <div class="col-md-2">
+                                <label class="form-label">Fecha Nacimiento</label>
+                                <input type="date" class="form-control">
+                            </div>
+                            
+                            <div class="col-md-2">
+                                <label class="form-label">Edad</label>
+                                <input type="text" class="form-control" readonly>
+                            </div>
+
+                            <!-- Más campos del formulario... -->
+                            <div class="col-12 text-end mt-5">
+                                <button type="button" class="btn btn-secondary me-2">
+                                    <i class="fas fa-times me-2"></i>Cancelar
+                                </button>
+                                <button type="submit" class="btn btn-success btn-lg">
+                                    <i class="fas fa-save me-2"></i>Guardar Empleado
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Tab Herramientas Masivas -->
+                <div class="tab-pane fade" id="herramientas-pane">
+                    <div class="card-body">
+                        <div class="row g-4">
+                            <div class="col-md-6">
+                                <div class="card h-100 border-success">
+                                    <div class="card-body text-center">
+                                        <div class="mb-3">
+                                            <i class="fas fa-file-excel fa-3x text-success"></i>
+                                        </div>
+                                        <h5 class="card-title">Carga Masiva de Empleados</h5>
+                                        <p class="card-text text-muted">
+                                            Sube un archivo Excel (.xlsx) para registrar múltiples empleados
+                                        </p>
+                                        <div class="mb-3">
+                                            <input type="file" class="form-control" accept=".xlsx">
+                                        </div>
+                                        <button type="button" class="btn btn-success">
+                                            <i class="fas fa-upload me-2"></i>Subir Archivo
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-6">
+                                <div class="card h-100 border-danger">
+                                    <div class="card-body text-center">
+                                        <div class="mb-3">
+                                            <i class="fas fa-user-slash fa-3x text-danger"></i>
+                                        </div>
+                                        <h5 class="card-title">Actualización de Desvinculaciones</h5>
+                                        <p class="card-text text-muted">
+                                            Procesa finiquitos masivamente con archivo Excel
+                                        </p>
+                                        <div class="mb-3">
+                                            <input type="file" class="form-control" accept=".xlsx">
+                                        </div>
+                                        <button type="button" class="btn btn-danger">
+                                            <i class="fas fa-arrow-right-from-bracket me-2"></i>Procesar
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Floating Action Button -->
+    <button class="floating-action" title="Agregar empleado rápido">
+        <i class="fas fa-plus"></i>
+    </button>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        // Theme Toggle
+        function toggleTheme() {
+            const body = document.body;
+            const themeIcon = document.getElementById('theme-icon');
+            const currentTheme = body.getAttribute('data-bs-theme');
+            
+            if (currentTheme === 'light') {
+                body.setAttribute('data-bs-theme', 'dark');
+                themeIcon.className = 'fas fa-sun';
+                // localStorage.setItem('theme', 'dark'); // Descomenta si usas fuera de Claude
+            } else {
+                body.setAttribute('data-bs-theme', 'light');
+                themeIcon.className = 'fas fa-moon';
+                // localStorage.setItem('theme', 'light'); // Descomenta si usas fuera de Claude
+            }
+        }
+
+        // Cargar tema guardado (descomenta si usas fuera de Claude)
+        /*
+        document.addEventListener('DOMContentLoaded', function() {
+            const savedTheme = localStorage.getItem('theme') || 'light';
+            document.body.setAttribute('data-bs-theme', savedTheme);
+            document.getElementById('theme-icon').className = savedTheme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+        });
+        */
+
+        // Campos clickeables mejorados
+        document.addEventListener('DOMContentLoaded', function() {
+            const clickableFields = document.querySelectorAll('.clickable-field');
+            
+            clickableFields.forEach(field => {
+                field.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    
+                    // Toggle visual
+                    this.classList.toggle('selected');
+                    
+                    // Encontrar checkbox correspondiente
+                    const row = this.closest('tr');
+                    const checkbox = row.querySelector('input[type="checkbox"]');
+                    
+                    if (checkbox) {
+                        checkbox.checked = this.classList.contains('selected');
+                    }
+                    
+                    updateSelectionCount();
+                });
+            });
+            
+            // Tooltip initialization
+            const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+            tooltipTriggerList.map(function (tooltipTriggerEl) {
+                return new bootstrap.Tooltip(tooltipTriggerEl);
+            });
+        });
+
+        // Actualizar contador de selección
+        function updateSelectionCount() {
+            const selectedCount = document.querySelectorAll('input[type="checkbox"]:checked').length - 1; // -1 para excluir el checkbox principal
+            const display = document.querySelector('.selection-display');
+            
+            if (selectedCount > 0) {
+                display.textContent = `${selectedCount} empleado${selectedCount !== 1 ? 's' : ''} seleccionado${selectedCount !== 1 ? 's' : ''}`;
+                display.style.display = 'inline-block';
+                display.className = selectedCount > 5 ? 'selection-display bg-warning' : 'selection-display';
+            } else {
+                display.style.display = 'none';
+            }
+        }
+
+        // Floating Action Button
+        document.querySelector('.floating-action').addEventListener('click', function() {
+            // Cambiar al tab de registro
+            const registerTab = new bootstrap.Tab(document.getElementById('registrar-tab'));
+            registerTab.show();
+            
+            // Scroll al top
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+
+        // Loading states
+        function showLoading(element) {
+            element.innerHTML = '<div class="spinner mx-auto"></div>';
+            element.disabled = true;
+        }
+
+        function hideLoading(element, originalText) {
+            element.innerHTML = originalText;
+            element.disabled = false;
+        }
+
+        // Efectos de hover para las tarjetas
+        document.querySelectorAll('.card').forEach(card => {
+            card.addEventListener('mouseenter', function() {
+                this.style.transform = 'translateY(-4px)';
+            });
+            
+            card.addEventListener('mouseleave', function() {
+                this.style.transform = 'translateY(0)';
+            });
+        });
+    </script>
+</body>
+</html>

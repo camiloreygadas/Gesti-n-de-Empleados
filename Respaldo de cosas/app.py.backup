@@ -1,0 +1,4030 @@
+import sqlite3
+import re
+import pandas as pd
+import os
+import io
+from flask import Flask, render_template, request, redirect, url_for, jsonify, flash, send_file, session
+import calendar
+import math
+from collections import Counter
+from pathlib import Path
+from itertools import groupby
+from datetime import datetime, timedelta
+from flask_mail import Mail, Message
+import json
+import unicodedata
+from werkzeug.utils import secure_filename
+import re
+from weasyprint import HTML, CSS
+from io import BytesIO
+import logging
+from functools import wraps
+import secrets
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# === CONFIGURACIÓN DE SEGURIDAD MEJORADA ===
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+
+# Configuración de base de datos
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(basedir, "asistencia.db")}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Configuración de archivos
+UPLOAD_FOLDER = os.path.join(basedir, 'uploads')
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
+MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
+
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+# === CONFIGURACIÓN DE CORREO ELECTRÓNICO ===
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = ('Alertas de Asistencia', os.environ.get('MAIL_USERNAME'))
+
+mail = Mail(app)
+
+# --- TAREA PROGRAMADA PARA ALERTAS DE CONTRATOS POR VENCER ---
+
+
+def enviar_alerta_contratos_vencimiento():
+    """
+    Busca empleados con fecha de vencimiento de contrato en los próximos 30 días
+    y envía un correo de alerta a RRHH si encuentra alguno.
+    """
+    from datetime import date, timedelta
+    
+    # Usamos with app.app_context() para poder ejecutar esto desde un script externo
+    with app.app_context():
+        conn = get_db_connection()
+        
+        # Definimos el rango de fechas: desde hoy hasta 30 días en el futuro
+        fecha_hoy = date.today()
+        fecha_limite = fecha_hoy + timedelta(days=30)
+        
+        # --- CONSULTA CORREGIDA ---
+        # Ahora busca directamente en la nueva columna y ya no necesita filtrar por tipo de contrato.
+        empleados_por_vencer = conn.execute(
+            """
+            SELECT nombre_completo, rut, fecha_vencimiento_contrato
+            FROM empleados
+            WHERE fecha_vencimiento_contrato BETWEEN ? AND ?
+            ORDER BY fecha_vencimiento_contrato ASC
+            """,
+            (fecha_hoy.strftime('%Y-%m-%d'), fecha_limite.strftime('%Y-%m-%d'))
+        ).fetchall()
+        
+        conn.close()
+
+        if empleados_por_vencer:
+            print(f"Se encontraron {len(empleados_por_vencer)} contratos por vencer. Enviando correo...")
+            
+            destinatarios = ["jlucasreygadas@gmail.com"] # <-- ¡Asegúrate de que este sea el correo correcto de RRHH!
+            
+            # Renderizamos el cuerpo del correo.
+            # Asegúrate de que la plantilla use 'fecha_vencimiento_contrato'
+            html_body = render_template('correo_contratos.html', empleados=empleados_por_vencer)
+            
+            msg = Message(
+                subject=f"Alerta: {len(empleados_por_vencer)} Contratos por Vencer en los Próximos 30 Días",
+                recipients=destinatarios,
+                html=html_body
+            )
+            # mail.send(msg) # Descomenta esta línea cuando tus credenciales de correo estén listas
+            print("Correo de alerta enviado exitosamente (simulado).")
+        else:
+            print("No se encontraron contratos por vencer en el período. No se envió correo.")
+
+# === FUNCIONES AUXILIARES MEJORADAS ===
+
+def get_db_connection():
+    """Crear conexión a la base de datos con manejo de errores."""
+    try:
+        conn = sqlite3.connect(
+            os.path.join(basedir, 'asistencia.db'), 
+            check_same_thread=False,
+            timeout=20
+        )
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"Error conectando a la base de datos: {e}")
+        raise
+def allowed_file(filename):
+    """Verificar si el archivo tiene una extensión permitida."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def handle_db_error(func):
+    """Decorador para manejo centralizado de errores de base de datos."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.Error as e:
+            logger.error(f"Error en {func.__name__}: {e}")
+            flash(f'Error en la base de datos: {str(e)}', 'error')
+            return redirect(url_for('index'))
+        except Exception as e:
+            logger.error(f"Error inesperado en {func.__name__}: {e}")
+            flash(f'Error inesperado: {str(e)}', 'error')
+            return redirect(url_for('index'))
+    return wrapper
+
+
+def cargar_catalogos(conn):
+    """Cargar todos los catálogos necesarios desde la base de datos."""
+    try:
+        # Mapa de colores para códigos de asistencia
+        color_map = {
+            'T': '#d1fae5',   # Verde claro (Presente)
+            'D': '#e5e7eb',   # Gris suave (Descanso)
+            'F': '#fee2e2',   # Rojo pálido (Falta)
+            'LM': '#fef3c7',  # Amarillo (Licencia Médica)
+            'V': '#dbeafe',   # Azul claro (Vacaciones)
+            'PP': '#e0e7ff',  # Índigo suave (Permiso Pago)
+            'PNP': '#fae8ff', # Púrpura suave (Permiso No Pago)
+            'MUT': '#fff7ed', # Naranja suave (Mutual)
+            'PSN': '#e0f2fe', # Cian suave (Post Natal)
+            'PF': '#fce7f3',  # Rosado suave (Fallecimiento)
+            'FQTO': '#6b7280' # Gris oscuro (Finiquito)
+        }
+        
+        codigos_asistencia_raw = conn.execute('SELECT * FROM codigos_asistencia').fetchall()
+        codigos_asistencia_con_color = []
+        
+        for codigo in codigos_asistencia_raw:
+            codigo_dict = dict(codigo)
+            codigo_dict['color'] = color_map.get(codigo['codigo'], '#ffffff')
+            codigos_asistencia_con_color.append(codigo_dict)
+
+        return {
+            'cargos': conn.execute('SELECT * FROM cargos ORDER BY nombre').fetchall(),
+            'turnos': conn.execute('SELECT * FROM turnos ORDER BY nombre').fetchall(),
+            'regiones': conn.execute('SELECT * FROM regiones ORDER BY id').fetchall(),
+            'nacionalidades': conn.execute('SELECT * FROM nacionalidades ORDER BY pais').fetchall(),
+            'tipos_contrato': conn.execute('SELECT * FROM tipos_contrato ORDER BY nombre').fetchall(),
+            'nominas': conn.execute('SELECT * FROM nominas ORDER BY nombre').fetchall(),
+            'relaciones_laborales': conn.execute('SELECT * FROM relaciones_laborales ORDER BY nombre').fetchall(),
+            'acreditaciones': conn.execute('SELECT * FROM acreditaciones ORDER BY nombre').fetchall(),
+            'areas': conn.execute('SELECT * FROM areas ORDER BY nombre').fetchall(),
+            'fases': conn.execute('SELECT * FROM fases ORDER BY nombre').fetchall(),
+            'distribucion_categorias': conn.execute('SELECT * FROM distribucion_categorias ORDER BY nombre').fetchall(),
+            'generos': conn.execute('SELECT * FROM generos ORDER BY nombre').fetchall(),
+            'supervisiones': conn.execute('SELECT * FROM supervisiones ORDER BY nombre').fetchall(),
+            'status_empleado': conn.execute('SELECT * FROM status_empleado ORDER BY nombre').fetchall(),
+            'causales_despido': conn.execute('SELECT * FROM causales_despido ORDER BY nombre_causal').fetchall(),
+            'tipos_pasaje': conn.execute('SELECT * FROM tipos_pasaje').fetchall(),
+            'codigos_asistencia': codigos_asistencia_con_color
+        }
+    except sqlite3.Error as e:
+        logger.error(f"Error cargando catálogos: {e}")
+        return {}
+    
+def validar_fechas(fecha_desde, fecha_hasta):
+    """Validar que las fechas sean correctas."""
+    try:
+        fecha_desde_obj = datetime.strptime(fecha_desde, '%Y-%m-%d').date()
+        fecha_hasta_obj = datetime.strptime(fecha_hasta, '%Y-%m-%d').date()
+        
+        if fecha_desde_obj > fecha_hasta_obj:
+            return None, None, "La fecha desde debe ser anterior a la fecha hasta"
+        
+        # Limitar rango a 1 año para performance
+        if (fecha_hasta_obj - fecha_desde_obj).days > 365:
+            return None, None, "El rango de fechas no puede exceder 1 año"
+            
+        return fecha_desde_obj, fecha_hasta_obj, None
+        
+    except ValueError:
+        return None, None, "Formato de fecha inválido"
+    
+def normalizar_rut(rut):
+    """Normaliza RUT removiendo puntos, guiones y espacios"""
+    if not rut:
+        return ""
+    return str(rut).replace('.', '').replace('-', '').replace(' ', '').upper().strip()
+
+
+
+@app.route('/')
+def index():
+    query = request.args.get('query', '').strip()
+    search_by = request.args.get('search_by', 'rut')
+    page = request.args.get('page', 1, type=int)
+    active_modules = request.args.get('active_modules', '')
+    per_page = 20
+    
+    if page < 1:
+        page = 1
+    
+    if search_by not in ['rut', 'id_sap_local', 'nombre']:
+        search_by = 'rut'
+
+    conn = get_db_connection()
+    catalogs = cargar_catalogos(conn)
+    
+    # Consultas base
+    count_query = 'SELECT COUNT(e.id) FROM empleados e'
+    base_query = '''
+        SELECT e.id, e.rut, e.nombre_completo, e.id_sap_local, e.telefono, 
+               c.nombre as cargo_nombre, a.nombre as area_nombre, s.nombre as status_nombre
+        FROM empleados e 
+        LEFT JOIN cargos c ON e.cargo_id = c.id
+        LEFT JOIN areas a ON e.area_id = a.id
+        LEFT JOIN status_empleado s ON e.status_id = s.id
+    '''
+    
+    params = []
+    where_clause = ''
+    is_search_active = bool(query)  # Bandera para saber si hay búsqueda activa
+
+    # LÓGICA DE BÚSQUEDA MEJORADA
+    if query:
+        print(f"🔍 Búsqueda activa: '{query}' por campo '{search_by}'")
+        
+        # Dividir la query en términos individuales
+        import re
+        search_terms = [term.strip() for term in re.split(r'[\s,\n\r]+', query) if term.strip()]
+        
+        if search_terms:
+            print(f"📝 Términos de búsqueda: {search_terms}")
+            
+            if search_by == 'rut':
+                # BÚSQUEDA FLEXIBLE POR RUT
+                conditions = []
+                for term in search_terms:
+                    rut_normalizado = normalizar_rut(term)
+                    conditions.append(
+                        f"(e.rut = ? OR REPLACE(REPLACE(REPLACE(e.rut, '.', ''), '-', ''), ' ', '') = ? OR e.rut LIKE ?)"
+                    )
+                    params.extend([term, rut_normalizado, f'%{rut_normalizado}%'])
+                
+                where_clause = f' WHERE ({" OR ".join(conditions)})'
+                
+            elif search_by == 'id_sap_local':
+                # BÚSQUEDA FLEXIBLE POR ID SAP
+                conditions = []
+                for term in search_terms:
+                    conditions.append("(e.id_sap_local = ? OR e.id_sap_local LIKE ? OR CAST(e.id_sap_local AS TEXT) = ?)")
+                    params.extend([term, f'%{term}%', term])
+                
+                where_clause = f' WHERE ({" OR ".join(conditions)})'
+                
+            else:
+                # Búsqueda por nombre (fallback)
+                like_conditions = ' OR '.join(['e.nombre_completo LIKE ?'] * len(search_terms))
+                where_clause = f' WHERE ({like_conditions})'
+                params = [f'%{term}%' for term in search_terms]
+
+    # Contar total de empleados
+    total_query = count_query + where_clause
+    total_empleados = conn.execute(total_query, params).fetchone()[0]
+    
+    # Si no encuentra nada con búsqueda activa, hacer búsqueda más amplia
+    if query and total_empleados == 0 and search_by in ['rut', 'id_sap_local']:
+        print("🔍 No se encontraron resultados, intentando búsqueda más amplia...")
+        
+        search_terms = [term.strip() for term in re.split(r'[\s,\n\r]+', query) if term.strip()]
+        mega_conditions = []
+        mega_params = []
+        
+        for term in search_terms:
+            if search_by == 'rut':
+                clean_term = normalizar_rut(term)
+                mega_conditions.extend([
+                    "e.rut LIKE ?",
+                    "REPLACE(REPLACE(REPLACE(e.rut, '.', ''), '-', ''), ' ', '') LIKE ?",
+                    "e.nombre_completo LIKE ?"
+                ])
+                mega_params.extend([f'%{term}%', f'%{clean_term}%', f'%{term}%'])
+            else:  # id_sap_local
+                mega_conditions.extend([
+                    "e.id_sap_local LIKE ?",
+                    "CAST(e.id_sap_local AS TEXT) LIKE ?",
+                    "e.rut LIKE ?",
+                    "e.nombre_completo LIKE ?"
+                ])
+                mega_params.extend([f'%{term}%', f'%{term}%', f'%{term}%', f'%{term}%'])
+        
+        mega_where = f' WHERE ({" OR ".join(mega_conditions)})'
+        total_empleados = conn.execute(count_query + mega_where, mega_params).fetchone()[0]
+        if total_empleados > 0:
+            where_clause = mega_where
+            params = mega_params
+            print(f"✅ Encontrados {total_empleados} con búsqueda ampliada")
+
+    # NUEVA LÓGICA DE PAGINACIÓN: Solo aplicar cuando NO hay búsqueda activa
+    if is_search_active:
+        total_pages = 1  # Una sola página para mostrar todos los resultados
+        print(f"📊 Búsqueda activa: mostrando todos los {total_empleados} resultados sin paginación")
+    else:
+        total_pages = math.ceil(total_empleados / per_page) if per_page > 0 else 1
+        print(f"📊 Sin búsqueda: {total_empleados} empleados en {total_pages} páginas")
+
+    # Construir consulta de datos
+    data_query = base_query + where_clause + ' ORDER BY e.id DESC'
+    
+    # APLICAR PAGINACIÓN SOLO CUANDO NO HAY BÚSQUEDA ACTIVA
+    if not is_search_active and total_pages > 1:
+        offset = (page - 1) * per_page
+        data_query += f' LIMIT {per_page} OFFSET {offset}'
+        print(f"📄 Aplicando paginación: LIMIT {per_page} OFFSET {offset}")
+    elif is_search_active:
+        print(f"🔍 Mostrando todos los resultados de búsqueda (sin límite)")
+
+    # Ejecutar consulta
+    empleados = conn.execute(data_query, params).fetchall()
+    conn.close()
+    
+    print(f"✅ Empleados obtenidos: {len(empleados)}")
+    
+    return render_template('gestionar_empleados.html', 
+                           empleados=empleados, 
+                           query=query, 
+                           search_by=search_by, 
+                           page=page, 
+                           total_pages=total_pages,
+                           total_empleados=total_empleados,
+                           is_search_active=is_search_active,  # Nueva variable
+                           active_modules=active_modules, 
+                           **catalogs)
+
+@app.route('/get_comunas/<int:region_id>')
+def get_comunas_por_region(region_id):
+    conn = get_db_connection()
+    comunas = conn.execute('SELECT c.id, c.comuna FROM comunas c JOIN provincias p ON c.provincia_id = p.id WHERE p.region_id = ? ORDER BY c.comuna', (region_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(ix) for ix in comunas])
+
+@app.route('/agregar', methods=['POST'])
+def agregar_empleado():
+    form_data = request.form.to_dict()
+    if 'edad_calculada' in form_data: del form_data['edad_calculada']
+    if 'fecha_vencimiento_contrato' in form_data and not form_data['fecha_vencimiento_contrato']:
+        form_data['fecha_vencimiento_contrato'] = None
+    conn = get_db_connection()  
+    try:
+        columns = ', '.join(form_data.keys())
+        placeholders = ', '.join(['?'] * len(form_data))
+        sql = f'INSERT INTO empleados ({columns}) VALUES ({placeholders})'
+        conn.execute(sql, list(form_data.values()))
+        conn.commit()
+        flash('Empleado agregado con éxito.', 'success')
+    except Exception as e:
+        flash(f'Error al agregar empleado: {e}', 'danger')
+    finally:
+        conn.close()
+    return redirect(url_for('index', active_modules='registrar_empleado,empleados_registrados'))
+ 
+@app.route('/editar/<int:id>')
+def editar_empleado(id):
+    conn = get_db_connection()
+    catalogs = cargar_catalogos(conn)
+    empleado = conn.execute('SELECT * FROM empleados WHERE id = ?', (id,)).fetchone()
+    comunas = conn.execute('SELECT * FROM comunas ORDER BY comuna').fetchall()
+    conn.close()
+    if empleado is None: return "Empleado no encontrado", 404
+    return render_template('editar_empleado.html', empleado=empleado, comunas=comunas, **catalogs)
+
+@app.route('/actualizar/<int:id>', methods=['POST'])
+def actualizar_empleado(id):
+    query_for_redirect = request.form.get('query')
+    search_by_for_redirect = request.form.get('search_by')
+    active_modules_for_redirect = request.form.get('active_modules', 'empleados_registrados')
+    
+    conn = get_db_connection()
+    empleado_actual = conn.execute('SELECT fecha_egreso FROM empleados WHERE id = ?', (id,)).fetchone()
+    fecha_egreso_anterior = empleado_actual['fecha_egreso'] if empleado_actual else None
+
+    campos_empleado = {
+        'rut': request.form.get('rut'), 'nombre_completo': request.form.get('nombre_completo'),
+        'fecha_nacimiento': request.form.get('fecha_nacimiento') or None, 'telefono': request.form.get('telefono'),
+        'correo_electronico': request.form.get('correo_electronico'), 'direccion': request.form.get('direccion'),
+        'genero_id': request.form.get('genero_id'), 'nacionalidad_id': request.form.get('nacionalidad_id'),
+        'id_sap_local': request.form.get('id_sap_local'), 'nomina_id': request.form.get('nomina_id'),
+        'fecha_ingreso': request.form.get('fecha_ingreso'), 'tipo_contrato_id': request.form.get('tipo_contrato_id'),
+        'relacion_laboral_id': request.form.get('relacion_laboral_id'), 'area_id': request.form.get('area_id'),
+        'cargo_id': request.form.get('cargo_id'), 'supervision_id': request.form.get('supervision_id'),
+        'turno_id': request.form.get('turno_id'), 'fase_id': request.form.get('fase_id'),
+        'distribucion_categoria_id': request.form.get('distribucion_categoria_id'),
+        'region_id': request.form.get('region_id'), 'comuna_id': request.form.get('comuna_id'),
+        'tipo_pasaje_id': request.form.get('tipo_pasaje_id'), 'acreditacion_id': request.form.get('acreditacion_id'),
+        'status_id': request.form.get('status_id'), 'fecha_egreso': request.form.get('fecha_egreso') or None,
+        'fecha_vencimiento_contrato': request.form.get('fecha_vencimiento_contrato') or None,
+        'causal_despido_id': request.form.get('causal_despido_id') or None,
+    }
+    if not campos_empleado['fecha_egreso']:
+        campos_empleado['causal_despido_id'] = None
+
+    update_fields = ', '.join([f'{key} = ?' for key in campos_empleado.keys()])
+    sql = f'UPDATE empleados SET {update_fields} WHERE id = ?'
+    values = list(campos_empleado.values())
+    values.append(id)
+    conn.execute(sql, values)
+    conn.commit()
+
+    fecha_egreso_nueva = campos_empleado['fecha_egreso']
+    if fecha_egreso_nueva:
+        fecha_egreso = datetime.strptime(fecha_egreso_nueva, '%Y-%m-%d').date()
+        fecha_inicio_fqto = fecha_egreso + timedelta(days=1)
+        max_fecha_str = conn.execute("SELECT MAX(fecha) as max_f FROM calendario_turnos").fetchone()['max_f']
+        fecha_fin_fqto = datetime.strptime(max_fecha_str, '%Y-%m-%d').date() if max_fecha_str else datetime(fecha_egreso.year + 1, 12, 31).date()
+        registros_fqto = []
+        current_date = fecha_inicio_fqto
+        while current_date <= fecha_fin_fqto:
+            registros_fqto.append((id, current_date.strftime('%Y-%m-%d'), 'FQTO'))
+            current_date += timedelta(days=1)
+        if registros_fqto:
+            sql_upsert_fqto = '''
+                INSERT INTO asistencia (empleado_id, fecha, codigo_asistencia_id) VALUES (?, ?, ?)
+                ON CONFLICT(empleado_id, fecha) DO UPDATE SET codigo_asistencia_id = excluded.codigo_asistencia_id;
+            '''
+            conn.executemany(sql_upsert_fqto, registros_fqto)
+            conn.commit()
+            flash('Asistencia futura del empleado marcada como "Finiquito".', 'info')
+    elif not fecha_egreso_nueva and fecha_egreso_anterior:
+        fecha_inicio_limpieza = (datetime.strptime(fecha_egreso_anterior, '%Y-%m-%d').date() + timedelta(days=1)).strftime('%Y-%m-%d')
+        conn.execute(
+            "DELETE FROM asistencia WHERE empleado_id = ? AND codigo_asistencia_id = 'FQTO' AND fecha >= ?",
+            (id, fecha_inicio_limpieza)
+        )
+        conn.commit()
+        flash('Marcas de finiquito eliminadas para el empleado reactivado.', 'info')
+
+    conn.close()
+    flash('Empleado actualizado con éxito.', 'success')
+    return redirect(url_for('index', query=query_for_redirect, search_by=search_by_for_redirect, active_modules=active_modules_for_redirect))
+
+@app.route('/eliminar/<int:id>', methods=['POST'])
+def eliminar_empleado(id):
+    conn = get_db_connection()
+    conn.execute('DELETE FROM asistencia WHERE empleado_id = ?', (id,))
+    conn.execute('DELETE FROM empleados WHERE id = ?', (id,))
+    conn.commit()
+    conn.close()
+    flash('Empleado eliminado correctamente.', 'success')
+    return redirect(url_for('index', active_modules='empleados_registrados'))
+
+def normalizar_texto(texto):
+    """
+    Normaliza texto para matching flexible:
+    - Convierte a minúsculas
+    - Elimina acentos y caracteres especiales
+    - Elimina espacios extra
+    """
+    if not texto or pd.isna(texto):
+        return ""
+    
+    # Convertir a string y a minúsculas
+    texto = str(texto).lower().strip()
+    
+    # Eliminar acentos usando unicodedata
+    texto_sin_acentos = unicodedata.normalize('NFD', texto)
+    texto_sin_acentos = ''.join(c for c in texto_sin_acentos if unicodedata.category(c) != 'Mn')
+    
+    # Eliminar caracteres especiales extra y espacios múltiples
+    texto_limpio = re.sub(r'[^\w\s]', '', texto_sin_acentos)
+    texto_limpio = re.sub(r'\s+', ' ', texto_limpio).strip()
+    
+    return texto_limpio
+
+def crear_mapa_flexible(conn, query, campo_nombre, campo_id='id'):
+    """
+    Crea un mapa flexible que puede encontrar coincidencias con diferentes formatos
+    """
+    resultados = conn.execute(query).fetchall()
+    mapa_directo = {}
+    mapa_normalizado = {}
+    
+    for row in resultados:
+        valor_original = row[campo_nombre]
+        valor_id = row[campo_id]
+        
+        # Mapa directo (exacto)
+        mapa_directo[valor_original] = valor_id
+        
+        # Mapa normalizado (flexible)
+        valor_normalizado = normalizar_texto(valor_original)
+        if valor_normalizado:
+            mapa_normalizado[valor_normalizado] = {
+                'id': valor_id,
+                'original': valor_original
+            }
+    
+    return mapa_directo, mapa_normalizado
+
+def buscar_id_flexible(valor_excel, mapa_directo, mapa_normalizado):
+    """
+    Busca el ID de forma flexible:
+    1. Primero intenta match exacto
+    2. Luego intenta match normalizado
+    """
+    if not valor_excel or pd.isna(valor_excel):
+        return None
+    
+    valor_str = str(valor_excel).strip()
+    
+    # Intento 1: Match exacto
+    if valor_str in mapa_directo:
+        return mapa_directo[valor_str]
+    
+    # Intento 2: Match flexible (normalizado)
+    valor_normalizado = normalizar_texto(valor_str)
+    if valor_normalizado in mapa_normalizado:
+        return mapa_normalizado[valor_normalizado]['id']
+    
+    # No se encontró match
+    return None
+
+@app.route('/upload_empleados', methods=['POST'])
+def upload_empleados():
+    try:
+        if 'archivo_excel' not in request.files:
+            flash('No se encontró el archivo en la petición.', 'error')
+            return redirect(url_for('index', active_modules='herramientas_masivas'))
+        
+        file = request.files['archivo_excel']
+        
+        # VALIDACIÓN MEJORADA
+        if not file or file.filename == '':
+            flash('No se seleccionó ningún archivo.', 'error')
+            return redirect(url_for('index', active_modules='herramientas_masivas'))
+        
+        # Validar extensión más robustamente
+        allowed_extensions = {'.xlsx', '.xls'}
+        file_ext = Path(file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            flash(f'Formato no válido. Use: {", ".join(allowed_extensions)}', 'error')
+            return redirect(url_for('index', active_modules='herramientas_masivas'))
+        
+        # Validar tamaño de archivo
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)  # Regresar al inicio
+        
+        if file_size > MAX_FILE_SIZE:
+            flash(f'Archivo muy grande. Máximo permitido: {MAX_FILE_SIZE // (1024*1024)}MB', 'error')
+            return redirect(url_for('index', active_modules='herramientas_masivas'))
+        
+        # Procesar fechas
+        if 'fecha_ingreso' in df.columns:
+            df['fecha_ingreso'] = pd.to_datetime(df['fecha_ingreso'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+        if 'fecha_nacimiento' in df.columns:
+            df['fecha_nacimiento'] = pd.to_datetime(df['fecha_nacimiento'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+        
+        df = df.fillna('')
+        
+        conn = get_db_connection()
+        
+        # CREAR MAPAS FLEXIBLES PARA CADA CAMPO
+        print("🔄 Creando mapas flexibles para matching...")
+        
+        mapas_directos = {}
+        mapas_normalizados = {}
+        
+        # Definir los campos que necesitan mapping flexible
+        campos_mapping = {
+            'genero_id': ('SELECT id, nombre FROM generos', 'genero', 'nombre'),
+            'nacionalidad_id': ('SELECT id, pais FROM nacionalidades', 'nacionalidad', 'pais'),
+            'cargo_id': ('SELECT id, nombre FROM cargos', 'cargo', 'nombre'),
+            'turno_id': ('SELECT id, nombre FROM turnos', 'turno', 'nombre'),
+            'comuna_id': ('SELECT id, comuna FROM comunas', 'comuna', 'comuna'),
+            'region_id': ('SELECT id, region FROM regiones', 'region', 'region'),
+            'tipo_contrato_id': ('SELECT id, nombre FROM tipos_contrato', 'tipo_contrato', 'nombre'),
+            'nomina_id': ('SELECT id, nombre FROM nominas', 'nomina', 'nombre'),
+            'relacion_laboral_id': ('SELECT id, nombre FROM relaciones_laborales', 'relacion_laboral', 'nombre'),
+            'acreditacion_id': ('SELECT id, nombre FROM acreditaciones', 'acreditacion', 'nombre'),
+            'area_id': ('SELECT id, nombre FROM areas', 'area', 'nombre'),
+            'fase_id': ('SELECT id, nombre FROM fases', 'fase', 'nombre'),
+            'distribucion_categoria_id': ('SELECT id, nombre FROM distribucion_categorias', 'distribucion_categoria', 'nombre'),
+            'supervision_id': ('SELECT id, nombre FROM supervisiones', 'supervision', 'nombre'),
+            'status_id': ('SELECT id, nombre FROM status_empleado', 'status', 'nombre')
+        }
+        
+        # Crear todos los mapas
+        for campo_id, (query, campo_excel, campo_bd) in campos_mapping.items():
+            directo, normalizado = crear_mapa_flexible(conn, query, campo_bd)
+            mapas_directos[campo_id] = (directo, normalizado, campo_excel)
+            print(f"✅ Mapa creado para {campo_excel}: {len(directo)} registros")
+        
+        nuevos_empleados = []
+        errores = []
+        warnings = []
+        
+        columnas_db = [
+            'rut', 'nombre_completo', 'fecha_nacimiento', 'telefono', 'direccion', 
+            'correo_electronico', 'id_sap_global', 'id_sap_local', 'fecha_ingreso',
+            'genero_id', 'nacionalidad_id', 'cargo_id', 'turno_id', 'comuna_id', 
+            'region_id', 'tipo_contrato_id', 'nomina_id', 'relacion_laboral_id', 
+            'acreditacion_id', 'area_id', 'fase_id', 'distribucion_categoria_id', 
+            'supervision_id', 'status_id'
+        ]
+        
+        print(f"🔍 Procesando {len(df)} filas...")
+        
+        for index, row in df.iterrows():
+            try:
+                # Datos básicos (sin mapping)
+                datos_basicos = [
+                    row.get('rut'), row.get('nombre_completo'), row.get('fecha_nacimiento'),
+                    row.get('telefono'), row.get('direccion'), row.get('correo_electronico'),
+                    row.get('id_sap_global'), row.get('id_sap_local'), row.get('fecha_ingreso')
+                ]
+                
+                # Datos que requieren mapping flexible
+                datos_mapeados = []
+                fila_warnings = []
+                
+                for campo_id, (mapa_directo, mapa_normalizado, campo_excel) in mapas_directos.items():
+                    valor_excel = row.get(campo_excel)
+                    id_encontrado = buscar_id_flexible(valor_excel, mapa_directo, mapa_normalizado)
+                    
+                    if valor_excel and not pd.isna(valor_excel) and valor_excel != '':
+                        if id_encontrado is None:
+                            # No se encontró el valor
+                            fila_warnings.append(f"'{valor_excel}' no encontrado en {campo_excel}")
+                            datos_mapeados.append(None)
+                        else:
+                            # Se encontró - verificar si fue por matching flexible
+                            valor_normalizado = normalizar_texto(str(valor_excel))
+                            if valor_normalizado in mapa_normalizado:
+                                original_bd = mapa_normalizado[valor_normalizado]['original']
+                                if str(valor_excel).strip() != original_bd:
+                                    fila_warnings.append(f"'{valor_excel}' → '{original_bd}' (matching flexible)")
+                            datos_mapeados.append(id_encontrado)
+                    else:
+                        datos_mapeados.append(None)
+                
+                # Combinar todos los datos
+                empleado_data = tuple(datos_basicos + datos_mapeados)
+                nuevos_empleados.append(empleado_data)
+                
+                # Agregar warnings si los hay
+                if fila_warnings:
+                    warnings.append(f"Fila {index + 2}: " + "; ".join(fila_warnings))
+                    
+            except Exception as e:
+                errores.append(f"Fila {index + 2}: Error - {e}")
+        
+        # Insertar empleados
+        if nuevos_empleados:
+            cursor = conn.cursor()
+            placeholders = ', '.join(['?'] * len(columnas_db))
+            sql = f'INSERT OR IGNORE INTO empleados ({", ".join(columnas_db)}) VALUES ({placeholders})'
+            
+            cursor.executemany(sql, nuevos_empleados)
+            conn.commit()
+            
+            insertados = cursor.rowcount
+            duplicados = len(nuevos_empleados) - insertados
+            
+            mensaje_exito = f'Carga completada. {insertados} empleados agregados.'
+            if duplicados > 0:
+                mensaje_exito += f' {duplicados} duplicados ignorados.'
+            
+            flash(mensaje_exito, 'success')
+            print(f"✅ {mensaje_exito}")
+        
+        # Mostrar warnings sobre matching flexible
+        if warnings:
+            mensaje_warnings = "Coincidencias encontradas con matching flexible: " + " | ".join(warnings[:10])
+            if len(warnings) > 10:
+                mensaje_warnings += f" ... y {len(warnings) - 10} más."
+            flash(mensaje_warnings, 'warning')
+            print(f"⚠️  {len(warnings)} warnings generados")
+        
+        # Mostrar errores
+        if errores:
+            mensaje_errores = 'Errores: ' + '; '.join(errores[:5])
+            if len(errores) > 5:
+                mensaje_errores += f' ... y {len(errores) - 5} más.'
+            flash(mensaje_errores, 'error')
+            print(f"❌ {len(errores)} errores encontrados")
+            
+    except Exception as e:
+        logger.error(f"Error en upload_empleados: {e}")
+        flash(f'Error procesando archivo: {str(e)}', 'error')
+        return redirect(url_for('index', active_modules='herramientas_masivas'))
+    
+# OPTIMIZAR CONSULTA DE BÚSQUEDA
+def construir_consulta_busqueda(query, search_by, params):
+    """Función auxiliar para construir consultas de búsqueda más eficientemente"""
+    
+    if not query:
+        return '', params
+    
+    # Dividir términos de búsqueda
+    search_terms = [term.strip() for term in re.split(r'[\s,\n\r]+', query) if term.strip()]
+    
+    if not search_terms:
+        return '', params
+    
+    conditions = []
+    
+    if search_by == 'rut':
+        for term in search_terms:
+            rut_normalizado = normalizar_rut(term)
+            conditions.append(
+                "(e.rut = ? OR REPLACE(REPLACE(REPLACE(e.rut, '.', ''), '-', ''), ' ', '') = ? OR e.rut LIKE ?)"
+            )
+            params.extend([term, rut_normalizado, f'%{rut_normalizado}%'])
+    
+    elif search_by == 'id_sap_local':
+        for term in search_terms:
+            conditions.append("(e.id_sap_local = ? OR e.id_sap_local LIKE ? OR CAST(e.id_sap_local AS TEXT) = ?)")
+            params.extend([term, f'%{term}%', term])
+    
+    else:  # nombre
+        like_conditions = ' OR '.join(['e.nombre_completo LIKE ?'] * len(search_terms))
+        conditions.append(f"({like_conditions})")
+        params.extend([f'%{term}%' for term in search_terms])
+    
+    where_clause = f" WHERE ({' OR '.join(conditions)})" if conditions else ''
+    return where_clause, params
+
+@app.route('/upload_desvinculaciones', methods=['POST'])
+def upload_desvinculaciones():
+    if 'archivo_excel' not in request.files:
+        flash('No se encontró el archivo en la petición.', 'error')
+        return redirect(url_for('index'))
+    file = request.files['archivo_excel']
+    if file.filename == '':
+        flash('No se seleccionó ningún archivo.', 'error')
+        return redirect(url_for('index'))
+    if not file.filename.endswith('.xlsx'):
+        flash('Formato de archivo no válido. Sube un archivo .xlsx', 'error')
+        return redirect(url_for('index'))
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(filepath)
+    try:
+        df = pd.read_excel(filepath)
+        df['fecha_egreso'] = pd.to_datetime(df['fecha_egreso'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        status_desvinculado_id = conn.execute("SELECT id FROM status_empleado WHERE nombre = 'Desvinculado'").fetchone()[0]
+        actualizados = 0
+        errores = []
+        for index, row in df.iterrows():
+            try:
+                cursor.execute('''
+                    UPDATE empleados 
+                    SET fecha_egreso = ?, causal_despido_id = ?, status_id = ?
+                    WHERE rut = ? AND id_sap_local = ?
+                ''', (row['fecha_egreso'], row['causal_despido_id'], status_desvinculado_id, row['rut'], row['id_sap_local']))
+                if cursor.rowcount > 0:
+                    actualizados += 1
+                else:
+                    errores.append(f"Fila {index + 2}: No se encontró ningún empleado con RUT {row['rut']} y ID SAP Local {row['id_sap_local']}.")
+            except Exception as e:
+                errores.append(f"Fila {index + 2}: {e}")
+        conn.commit()
+        flash(f'Proceso de desvinculación completado. {actualizados} empleados actualizados.', 'success')
+        if errores:
+            flash('Errores encontrados: ' + '; '.join(errores), 'error')
+    except Exception as e:
+        flash(f'Ocurrió un error crítico al procesar el archivo: {e}', 'error')
+    finally:
+        if 'conn' in locals() and conn: conn.close()
+        if os.path.exists(filepath): os.remove(filepath)
+    return redirect(url_for('index'))
+
+@app.route('/editar_masivo', methods=['POST'])
+def editar_masivo():
+    empleado_ids = request.form.getlist('empleado_ids')
+    accion = request.form.get('accion')
+    query = request.form.get('query')
+    search_by = request.form.get('search_by')
+
+    if not empleado_ids or not accion:
+        flash('No seleccionaste empleados o ninguna acción.', 'error')
+        return redirect(url_for('index', query=query, search_by=search_by))
+    
+    conn = get_db_connection()
+
+    if accion.startswith('planificar-'):
+        codigo_asistencia = accion.split('-')[1]
+        fecha_inicio_str = request.form.get('fecha_inicio')
+        fecha_fin_str = request.form.get('fecha_fin')
+
+        if not fecha_inicio_str or not fecha_fin_str:
+            flash('Debes seleccionar una fecha de inicio y fin para planificar.', 'error')
+            conn.close()
+            return redirect(url_for('index', query=query, search_by=search_by))
+
+        fecha_inicio = datetime.strptime(fecha_inicio_str, '%Y-%m-%d').date()
+        fecha_fin = datetime.strptime(fecha_fin_str, '%Y-%m-%d').date()
+        
+        registros_para_guardar = []
+        current_date = fecha_inicio
+        while current_date <= fecha_fin:
+            for empleado_id in empleado_ids:
+                registros_para_guardar.append((empleado_id, current_date.strftime('%Y-%m-%d'), codigo_asistencia))
+            current_date += timedelta(days=1)
+        
+        if registros_para_guardar:
+            sql = '''
+                INSERT INTO asistencia (empleado_id, fecha, codigo_asistencia_id) VALUES (?, ?, ?)
+                ON CONFLICT(empleado_id, fecha) DO UPDATE SET codigo_asistencia_id = excluded.codigo_asistencia_id;
+            '''
+            conn.executemany(sql, registros_para_guardar)
+            flash(f'Evento "{codigo_asistencia}" planificado para {len(empleado_ids)} empleados desde {fecha_inicio_str} hasta {fecha_fin_str}.', 'success')
+
+    elif accion == 'eliminar':
+        placeholders = ', '.join(['?'] * len(empleado_ids))
+        conn.execute(f'DELETE FROM asistencia WHERE empleado_id IN ({placeholders})', empleado_ids)
+        conn.execute(f'DELETE FROM empleados WHERE id IN ({placeholders})', empleado_ids)
+        flash(f'{len(empleado_ids)} empleados eliminados correctamente.', 'success')
+    
+    else:
+        nuevo_valor = request.form.get(f'nuevo_valor_{accion}')
+        columnas_validas = ['area_id', 'turno_id', 'status_id', 'acreditacion_id', 'nomina_id']
+        if accion in columnas_validas:
+            placeholders = ', '.join(['?'] * len(empleado_ids))
+            sql = f'UPDATE empleados SET {accion} = ? WHERE id IN ({placeholders})'
+            params = [nuevo_valor] + empleado_ids
+            conn.execute(sql, params)
+            flash(f'{len(empleado_ids)} empleados actualizados correctamente.', 'success')
+        else:
+            flash('Acción masiva no válida.', 'error')
+
+    conn.commit()
+    conn.close()
+    return redirect(url_for('index', query=query, search_by=search_by))
+
+# --- MÓDULO DE ASISTENCIA ---
+
+@app.route('/asistencia')
+def registrar_asistencia():
+    try:
+        ano = int(request.args.get('ano', datetime.now().year))
+        mes = int(request.args.get('mes', datetime.now().month))
+    except (ValueError, TypeError):
+        ano = datetime.now().year
+        mes = datetime.now().month
+    
+    query = request.args.get('query')
+    
+    dias_del_mes = [d for d in calendar.Calendar().itermonthdates(ano, mes) if d.month == mes]
+    
+    primer_dia_mes_actual = datetime(ano, mes, 1).date()
+    mes_anterior_obj = primer_dia_mes_actual - timedelta(days=1)
+    mes_siguiente_obj = primer_dia_mes_actual + timedelta(days=32)
+    mes_anterior = {'ano': mes_anterior_obj.year, 'mes': mes_anterior_obj.month}
+    mes_siguiente = {'ano': mes_siguiente_obj.year, 'mes': mes_siguiente_obj.month}
+    
+    primer_dia_str = f'{ano:04d}-{mes:02d}-01'
+    ultimo_dia_del_mes = calendar.monthrange(ano, mes)[1]
+    ultimo_dia_str = f'{ano:04d}-{mes:02d}-{ultimo_dia_del_mes}'
+
+    conn = get_db_connection()
+    
+    # CONSULTA MODIFICADA - Incluir fechas de ingreso y egreso
+    sql_empleados = '''
+        SELECT e.id, e.nombre_completo, e.rut, e.id_sap_local, 
+               t.nombre as turno_nombre, e.turno_id,
+               e.fecha_ingreso, e.fecha_egreso
+        FROM empleados e 
+        LEFT JOIN turnos t ON e.turno_id = t.id 
+        WHERE e.fecha_ingreso <= ? AND (e.fecha_egreso >= ? OR e.fecha_egreso IS NULL)
+    '''
+    params = [ultimo_dia_str, primer_dia_str]
+    
+    if query:
+        sql_empleados += " AND (e.nombre_completo LIKE ? OR e.rut LIKE ? OR e.id_sap_local LIKE ?)"
+        params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+    sql_empleados += ' ORDER BY e.nombre_completo'
+    
+    empleados = conn.execute(sql_empleados, params).fetchall()
+    codigos_asistencia = conn.execute('SELECT codigo, descripcion FROM codigos_asistencia').fetchall()
+    
+    calendario_mes = conn.execute(
+        "SELECT turno_id, fecha, codigo FROM calendario_turnos WHERE strftime('%Y-%m', fecha) = ?",
+        (f'{ano:04d}-{mes:02d}',)
+    ).fetchall()
+    
+    mapa_turnos_mes = {}
+    for registro in calendario_mes:
+        fecha_obj = datetime.strptime(registro['fecha'], '%Y-%m-%d').date()
+        turno_id = registro['turno_id']
+        if turno_id not in mapa_turnos_mes: mapa_turnos_mes[turno_id] = {}
+        mapa_turnos_mes[turno_id][fecha_obj.day] = registro['codigo']
+
+    asistencia_grid = {}
+    for empleado in empleados:
+        asistencia_grid[empleado['id']] = {}
+        turno_empleado_id = empleado['turno_id']
+        
+        # NUEVA LÓGICA - Solo crear grid para días válidos según fechas de ingreso/egreso
+        fecha_ingreso = datetime.strptime(empleado['fecha_ingreso'], '%Y-%m-%d').date()
+        fecha_egreso = None
+        if empleado['fecha_egreso']:
+            fecha_egreso = datetime.strptime(empleado['fecha_egreso'], '%Y-%m-%d').date()
+        
+        if turno_empleado_id in mapa_turnos_mes:
+            for dia in dias_del_mes:
+                # Verificar si el día está dentro del período laboral del empleado
+                if dia >= fecha_ingreso and (fecha_egreso is None or dia <= fecha_egreso):
+                    asistencia_grid[empleado['id']][dia.day] = mapa_turnos_mes[turno_empleado_id].get(dia.day, '')
+
+    asistencias_mes = conn.execute(
+        "SELECT empleado_id, fecha, codigo_asistencia_id FROM asistencia WHERE strftime('%Y-%m', fecha) = ?",
+        (f'{ano:04d}-{mes:02d}',)
+    ).fetchall()
+    conn.close()
+
+    for asistencia in asistencias_mes:
+        fecha_obj = datetime.strptime(asistencia['fecha'], '%Y-%m-%d').date()
+        if asistencia['empleado_id'] in asistencia_grid:
+            # Solo sobrescribir si el día está en el grid (dentro del período laboral)
+            if fecha_obj.day in asistencia_grid[asistencia['empleado_id']]:
+                asistencia_grid[asistencia['empleado_id']][fecha_obj.day] = asistencia['codigo_asistencia_id']
+
+    nombres_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+    nombre_mes = nombres_meses[mes - 1]
+
+    today = datetime.now().date()
+    dias_festivos = {
+        # Días festivos de Chile 2025-2027
+        '2025-01-01', '2025-04-18', '2025-04-19', '2025-05-01', '2025-05-21',
+        '2025-06-20', '2025-07-16', '2025-08-15', '2025-09-18', '2025-09-19',
+        '2025-10-31', '2025-11-01', '2025-12-08', '2025-12-25',
+        '2026-01-01', '2026-04-03', '2026-04-04', '2026-05-01', '2026-05-21',
+        '2026-06-21', '2026-06-29', '2026-07-16', '2026-08-15', '2026-08-20',
+        '2026-09-18', '2026-09-19', '2026-10-12', '2026-10-31', '2026-12-08', '2026-12-25'
+    }
+
+    # AGREGAR INFORMACIÓN DE FECHAS PARA EL TEMPLATE
+    empleados_con_fechas = []
+    for empleado in empleados:
+        empleado_dict = dict(empleado)
+        empleado_dict['fecha_ingreso_obj'] = datetime.strptime(empleado['fecha_ingreso'], '%Y-%m-%d').date()
+        if empleado['fecha_egreso']:
+            empleado_dict['fecha_egreso_obj'] = datetime.strptime(empleado['fecha_egreso'], '%Y-%m-%d').date()
+        else:
+            empleado_dict['fecha_egreso_obj'] = None
+        empleados_con_fechas.append(empleado_dict)
+
+    turnos_originales = {}
+    for registro in calendario_mes:
+        fecha_obj = datetime.strptime(registro['fecha'], '%Y-%m-%d').date()
+        turno_id = registro['turno_id']
+        if turno_id not in turnos_originales:
+            turnos_originales[turno_id] = {}
+        turnos_originales[turno_id][fecha_obj.day] = registro['codigo']
+
+    return render_template('registrar_asistencia.html', 
+                           empleados=empleados_con_fechas,  # Usar empleados con fechas procesadas
+                           codigos_asistencia=codigos_asistencia,
+                           dias_del_mes=dias_del_mes,
+                           asistencia_grid=asistencia_grid,
+                           ano=ano, mes=mes,
+                           nombre_mes=nombre_mes,
+                           mes_anterior=mes_anterior,
+                           mes_siguiente=mes_siguiente,
+                           today=today,
+                           query=query,
+                           dias_festivos=dias_festivos,
+                           turnos_originales=turnos_originales)
+    
+@app.route('/guardar_asistencia', methods=['POST'])
+def guardar_asistencia():
+    ano = int(request.form.get('ano'))
+    mes = int(request.form.get('mes'))
+    
+    registros_para_guardar = []
+    registros_para_borrar = []
+    
+    nombres_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+
+    for key, codigo_asistencia in request.form.items():
+        if key.startswith('asistencia-'):
+            parts = key.split('-')
+            empleado_id = int(parts[1])
+            dia = int(parts[2])
+            fecha = f'{ano:04d}-{mes:02d}-{dia:02d}'
+            if codigo_asistencia:
+                registros_para_guardar.append((empleado_id, fecha, codigo_asistencia))
+            else:
+                registros_para_borrar.append((empleado_id, fecha))
+    
+    conn = get_db_connection()
+    if registros_para_guardar:
+        sql_upsert = '''
+            INSERT INTO asistencia (empleado_id, fecha, codigo_asistencia_id) VALUES (?, ?, ?)
+            ON CONFLICT(empleado_id, fecha) DO UPDATE SET codigo_asistencia_id = excluded.codigo_asistencia_id;
+        '''
+        conn.executemany(sql_upsert, registros_para_guardar)
+    
+    if registros_para_borrar:
+        sql_delete = 'DELETE FROM asistencia WHERE empleado_id = ? AND fecha = ?'
+        conn.executemany(sql_delete, registros_para_borrar)
+    
+    conn.commit()
+    conn.close()
+    flash(f'Asistencia para {nombres_meses[mes - 1]} {ano} guardada/actualizada correctamente.', 'success')
+    return redirect(url_for('registrar_asistencia', ano=ano, mes=mes))
+
+@app.route('/exportar_asistencia')
+def exportar_asistencia():
+    try:
+        # Obtener parámetros
+        ano = int(request.args.get('ano', datetime.now().year))
+        mes = int(request.args.get('mes', datetime.now().month))
+        query = request.args.get('query')
+
+        print(f"Exportando asistencia para {mes}/{ano}")
+        
+        # Usar la misma lógica que la vista web
+        dias_del_mes = [d for d in calendar.Calendar().itermonthdates(ano, mes) if d.month == mes]
+        
+        primer_dia_str = f'{ano:04d}-{mes:02d}-01'
+        ultimo_dia_del_mes = calendar.monthrange(ano, mes)[1]
+        ultimo_dia_str = f'{ano:04d}-{mes:02d}-{ultimo_dia_del_mes}'
+
+        conn = get_db_connection()
+        
+        # Consulta COMPLETA con toda la información del empleado
+        sql_empleados = '''
+            SELECT e.*, 
+                g.nombre as genero, n.pais as nacionalidad, c.nombre as cargo, t.nombre as turno,
+                co.comuna, r.region, tc.nombre as tipo_contrato, nom.nombre as nomina,
+                rl.nombre as relacion_laboral, ac.nombre as acreditacion, ar.nombre as area,
+                fa.nombre as fase, dc.nombre as distribucion_categoria, s.nombre as supervision,
+                st.nombre as status, cd.nombre_causal as causal_despido, tp.nombre as tipo_pasaje
+            FROM empleados e
+            LEFT JOIN generos g ON e.genero_id = g.id
+            LEFT JOIN nacionalidades n ON e.nacionalidad_id = n.id
+            LEFT JOIN cargos c ON e.cargo_id = c.id
+            LEFT JOIN turnos t ON e.turno_id = t.id
+            LEFT JOIN comunas co ON e.comuna_id = co.id
+            LEFT JOIN regiones r ON e.region_id = r.id
+            LEFT JOIN tipos_contrato tc ON e.tipo_contrato_id = tc.id
+            LEFT JOIN nominas nom ON e.nomina_id = nom.id
+            LEFT JOIN relaciones_laborales rl ON e.relacion_laboral_id = rl.id
+            LEFT JOIN acreditaciones ac ON e.acreditacion_id = ac.id
+            LEFT JOIN areas ar ON e.area_id = ar.id
+            LEFT JOIN fases fa ON e.fase_id = fa.id
+            LEFT JOIN distribucion_categorias dc ON e.distribucion_categoria_id = dc.id
+            LEFT JOIN supervisiones s ON e.supervision_id = s.id
+            LEFT JOIN status_empleado st ON e.status_id = st.id
+            LEFT JOIN causales_despido cd ON e.causal_despido_id = cd.id
+            LEFT JOIN tipos_pasaje tp ON e.tipo_pasaje_id = tp.id
+            WHERE e.fecha_ingreso <= ? AND (e.fecha_egreso >= ? OR e.fecha_egreso IS NULL)
+        '''
+        params = [ultimo_dia_str, primer_dia_str]
+        
+        if query:
+            sql_empleados += " AND (e.nombre_completo LIKE ? OR e.rut LIKE ? OR e.id_sap_local LIKE ?)"
+            params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+        sql_empleados += ' ORDER BY e.nombre_completo'
+        
+        empleados = conn.execute(sql_empleados, params).fetchall()
+        
+        if not empleados:
+            flash('No hay empleados para exportar.', 'error')
+            conn.close()
+            return redirect(url_for('registrar_asistencia', ano=ano, mes=mes, query=query))
+
+        print(f"Empleados encontrados: {len(empleados)}")
+
+        # Lógica del calendario de turnos
+        calendario_mes = conn.execute(
+            "SELECT turno_id, fecha, codigo FROM calendario_turnos WHERE strftime('%Y-%m', fecha) = ?",
+            (f'{ano:04d}-{mes:02d}',)
+        ).fetchall()
+        
+        mapa_turnos_mes = {}
+        for registro in calendario_mes:
+            fecha_obj = datetime.strptime(registro['fecha'], '%Y-%m-%d').date()
+            turno_id = registro['turno_id']
+            if turno_id not in mapa_turnos_mes: 
+                mapa_turnos_mes[turno_id] = {}
+            mapa_turnos_mes[turno_id][fecha_obj.day] = registro['codigo']
+
+        # Grid de asistencia
+        asistencia_grid = {}
+        for empleado in empleados:
+            asistencia_grid[empleado['id']] = {}
+            turno_empleado_id = empleado['turno_id']
+            if turno_empleado_id in mapa_turnos_mes:
+                for dia in dias_del_mes:
+                    asistencia_grid[empleado['id']][dia.day] = mapa_turnos_mes[turno_empleado_id].get(dia.day, '')
+
+        # Asistencias manuales
+        asistencias_mes = conn.execute(
+            "SELECT empleado_id, fecha, codigo_asistencia_id FROM asistencia WHERE strftime('%Y-%m', fecha) = ?",
+            (f'{ano:04d}-{mes:02d}',)
+        ).fetchall()
+
+        # Sobrescribir con asistencias manuales
+        for asistencia in asistencias_mes:
+            fecha_obj = datetime.strptime(asistencia['fecha'], '%Y-%m-%d').date()
+            if asistencia['empleado_id'] in asistencia_grid:
+                asistencia_grid[asistencia['empleado_id']][fecha_obj.day] = asistencia['codigo_asistencia_id']
+
+        conn.close()
+
+        # Crear encabezados completos
+        # Información del empleado
+        headers_empleado = [
+            'RUT', 'Nombre Completo', 'ID SAP Global', 'ID SAP Local', 'Edad', 
+            'Teléfono', 'Email', 'Dirección', 'Género', 'Nacionalidad',
+            'Cargo', 'Turno', 'Comuna', 'Región', 'Tipo Contrato', 'Nómina',
+            'Relación Laboral', 'Acreditación', 'Área', 'Fase', 
+            'Distribución Categoría', 'Supervisión', 'Status', 'Tipo Pasaje',
+            'Fecha Ingreso', 'Fecha Egreso', 'Causal Despido'
+        ]
+        
+        # Días del mes con formato correcto (Día de semana + número)
+        dias_semana = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+        headers_dias = []
+        for dia in dias_del_mes:
+            dia_semana = dias_semana[dia.weekday()]
+            headers_dias.append(f"{dia_semana} {dia.day}")
+        
+        headers = headers_empleado + headers_dias
+
+        # Crear datos para Excel
+        excel_data = []
+        fecha_actual = datetime.now()
+        
+        for empleado in empleados:
+            # Calcular edad
+            edad = ''
+            if empleado['fecha_nacimiento']:
+                try:
+                    fecha_nac = datetime.strptime(empleado['fecha_nacimiento'], '%Y-%m-%d')
+                    edad = (fecha_actual - fecha_nac).days // 365
+                except:
+                    edad = ''
+            
+            # Formatear fechas al formato chileno
+            fecha_ingreso = ''
+            if empleado['fecha_ingreso']:
+                try:
+                    fecha_obj = datetime.strptime(empleado['fecha_ingreso'], '%Y-%m-%d')
+                    fecha_ingreso = fecha_obj.strftime('%d-%m-%Y')
+                except:
+                    fecha_ingreso = empleado['fecha_ingreso']
+            
+            fecha_egreso = ''
+            if empleado['fecha_egreso']:
+                try:
+                    fecha_obj = datetime.strptime(empleado['fecha_egreso'], '%Y-%m-%d')
+                    fecha_egreso = fecha_obj.strftime('%d-%m-%Y')
+                except:
+                    fecha_egreso = empleado['fecha_egreso']
+
+            # Información completa del empleado
+            fila = [
+                empleado['rut'] or '',
+                empleado['nombre_completo'] or '',
+                empleado['id_sap_global'] or '',
+                empleado['id_sap_local'] or '',
+                edad,
+                empleado['telefono'] or '',
+                empleado['correo_electronico'] or '',
+                empleado['direccion'] or '',
+                empleado['genero'] or '',
+                empleado['nacionalidad'] or '',
+                empleado['cargo'] or '',
+                empleado['turno'] or '',
+                empleado['comuna'] or '',
+                empleado['region'] or '',
+                empleado['tipo_contrato'] or '',
+                empleado['nomina'] or '',
+                empleado['relacion_laboral'] or '',
+                empleado['acreditacion'] or '',
+                empleado['area'] or '',
+                empleado['fase'] or '',
+                empleado['distribucion_categoria'] or '',
+                empleado['supervision'] or '',
+                empleado['status'] or '',
+                empleado['tipo_pasaje'] or '',
+                fecha_ingreso,
+                fecha_egreso,
+                empleado['causal_despido'] or ''
+            ]
+            
+            # Códigos de asistencia para cada día
+            empleado_asistencias = asistencia_grid.get(empleado['id'], {})
+            for dia in dias_del_mes:
+                codigo = empleado_asistencias.get(dia.day, '')
+                fila.append(codigo)
+            
+            excel_data.append(fila)
+
+        # Crear DataFrame
+        df = pd.DataFrame(excel_data, columns=headers)
+        
+        print(f"DataFrame creado: {len(df)} filas, {len(df.columns)} columnas")
+
+        # Crear archivo Excel con formato
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            nombres_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 
+                           'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+            sheet_name = f'{nombres_meses[mes-1]} {ano}'
+            
+            # Escribir datos
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            
+            workbook = writer.book
+            worksheet = writer.sheets[sheet_name]
+            
+            # Formatos para códigos de asistencia
+            formato_T = workbook.add_format({'bg_color': '#d1fae5', 'align': 'center', 'border': 1})
+            formato_D = workbook.add_format({'bg_color': '#e5e7eb', 'align': 'center', 'border': 1})
+            formato_F = workbook.add_format({'bg_color': '#fee2e2', 'align': 'center', 'border': 1})
+            formato_LM = workbook.add_format({'bg_color': '#fef3c7', 'align': 'center', 'border': 1})
+            formato_V = workbook.add_format({'bg_color': '#dbeafe', 'align': 'center', 'border': 1})
+            formato_PP = workbook.add_format({'bg_color': '#e0e7ff', 'align': 'center', 'border': 1})
+            formato_PNP = workbook.add_format({'bg_color': '#fae8ff', 'align': 'center', 'border': 1})
+            formato_MUT = workbook.add_format({'bg_color': '#fff7ed', 'align': 'center', 'border': 1})
+            formato_PSN = workbook.add_format({'bg_color': '#e0f2fe', 'align': 'center', 'border': 1})
+            formato_PF = workbook.add_format({'bg_color': '#fce7f3', 'align': 'center', 'border': 1})
+            formato_FQTO = workbook.add_format({'bg_color': '#6b7280', 'font_color': '#ffffff', 'align': 'center', 'border': 1})
+            
+            # Formato para días festivos
+            dias_festivos = {
+                '2025-01-01', '2025-04-18', '2025-04-19', '2025-05-01', '2025-05-21',
+                '2025-06-20', '2025-07-16', '2025-08-15', '2025-09-18', '2025-09-19',
+                '2025-10-31', '2025-11-01', '2025-12-08', '2025-12-25'
+            }
+            formato_festivo = workbook.add_format({'bg_color': '#ef5350', 'font_color': 'white', 'align': 'center', 'border': 1, 'bold': True})
+            
+            formato_vacio = workbook.add_format({'align': 'center', 'border': 1})
+            formato_info = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
+            
+            formatos = {
+                'T': formato_T, 'D': formato_D, 'F': formato_F, 'LM': formato_LM,
+                'V': formato_V, 'PP': formato_PP, 'PNP': formato_PNP, 'MUT': formato_MUT,
+                'PSN': formato_PSN, 'PF': formato_PF, 'FQTO': formato_FQTO, '': formato_vacio
+            }
+            
+            # Formato para encabezados
+            formato_header_info = workbook.add_format({
+                'bold': True, 'bg_color': '#f3f4f6', 'border': 2,
+                'align': 'center', 'valign': 'vcenter', 'text_wrap': True
+            })
+            
+            formato_header_dias = workbook.add_format({
+                'bold': True, 'bg_color': '#dbeafe', 'border': 2,
+                'align': 'center', 'valign': 'vcenter', 'rotation': 90
+            })
+            
+            # Aplicar formato a encabezados
+            num_cols_empleado = len(headers_empleado)
+            for col in range(num_cols_empleado):
+                worksheet.write(0, col, headers[col], formato_header_info)
+            
+            for col in range(num_cols_empleado, len(headers)):
+                worksheet.write(0, col, headers[col], formato_header_dias)
+            
+            # Configurar anchos de columnas
+            worksheet.set_column('A:A', 12)   # RUT
+            worksheet.set_column('B:B', 35)   # Nombre
+            worksheet.set_column('C:C', 12)   # ID SAP Global
+            worksheet.set_column('D:D', 12)   # ID SAP Local
+            worksheet.set_column('E:E', 8)    # Edad
+            worksheet.set_column('F:F', 15)   # Teléfono
+            worksheet.set_column('G:G', 25)   # Email
+            worksheet.set_column('H:H', 30)   # Dirección
+            worksheet.set_column('I:I', 10)   # Género
+            worksheet.set_column('J:J', 15)   # Nacionalidad
+            worksheet.set_column('K:K', 25)   # Cargo
+            worksheet.set_column('L:L', 20)   # Turno
+            worksheet.set_column('M:M', 15)   # Comuna
+            worksheet.set_column('N:N', 15)   # Región
+            worksheet.set_column('O:O', 20)   # Tipo Contrato
+            worksheet.set_column('P:P', 15)   # Nómina
+            worksheet.set_column('Q:Q', 20)   # Relación Laboral
+            worksheet.set_column('R:R', 15)   # Acreditación
+            worksheet.set_column('S:S', 20)   # Área
+            worksheet.set_column('T:T', 15)   # Fase
+            worksheet.set_column('U:U', 20)   # Distribución
+            worksheet.set_column('V:V', 15)   # Supervisión
+            worksheet.set_column('W:W', 12)   # Status
+            worksheet.set_column('X:X', 15)   # Tipo Pasaje
+            worksheet.set_column('Y:Y', 12)   # Fecha Ingreso
+            worksheet.set_column('Z:Z', 12)   # Fecha Egreso
+            worksheet.set_column('AA:AA', 20) # Causal Despido
+            
+            # Columnas de días (estrechas)
+            for col in range(num_cols_empleado, len(headers)):
+                worksheet.set_column(col, col, 6)
+            
+            # Aplicar formato a datos
+            for row in range(len(df)):
+                for col in range(len(headers)):
+                    valor = df.iloc[row, col]
+                    
+                    if col >= num_cols_empleado:  # Columnas de días
+                        # Verificar si es día festivo
+                        dia_header = headers[col]
+                        dia_num = int(dia_header.split()[-1])
+                        fecha_str = f"{ano:04d}-{mes:02d}-{dia_num:02d}"
+                        
+                        if fecha_str in dias_festivos and valor in ['T', 'D', '']:
+                            worksheet.write(row + 1, col, valor, formato_festivo)
+                        else:
+                            formato = formatos.get(valor, formato_vacio)
+                            worksheet.write(row + 1, col, valor, formato)
+                    else:
+                        # Información del empleado
+                        worksheet.write(row + 1, col, valor, formato_info)
+        
+        output.seek(0)
+        
+        nombres_meses = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 
+                        'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+        nombre_archivo = f'asistencia_completa_{nombres_meses[mes-1]}_{ano}.xlsx'
+        
+        print(f"Exportación completada: {nombre_archivo}")
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=nombre_archivo
+        )
+    
+    except Exception as e:
+        import traceback
+        print("ERROR EN EXPORTACIÓN:")
+        print(traceback.format_exc())
+        flash(f'Error al exportar: {str(e)}', 'error')
+        return redirect(url_for('registrar_asistencia', ano=ano, mes=mes, query=query))
+    
+# PLANIFICADOR DE EVENTOS
+
+# REEMPLAZAR COMPLETAMENTE la ruta /aplicar_evento_rango en app.py:
+
+@app.route('/aplicar_evento_rango', methods=['POST'])
+def aplicar_evento_rango():
+    try:
+        data = request.get_json()
+        
+        empleados_ids = data.get('empleados_ids', [])
+        codigo_asistencia = data.get('codigo_asistencia')
+        fecha_desde = data.get('fecha_desde')
+        fecha_hasta = data.get('fecha_hasta')
+        sobrescribir = data.get('sobrescribir', False)
+        
+        if not all([empleados_ids, codigo_asistencia, fecha_desde, fecha_hasta]):
+            return jsonify({
+                'status': 'error', 
+                'message': 'Datos incompletos'
+            }), 400
+        
+        from datetime import datetime, timedelta
+        fecha_inicio = datetime.strptime(fecha_desde, '%Y-%m-%d').date()
+        fecha_fin = datetime.strptime(fecha_hasta, '%Y-%m-%d').date()
+        
+        conn = get_db_connection()
+        
+        # Obtener nombres de empleados para el debug
+        empleados_info = {}
+        for emp_id in empleados_ids:
+            emp = conn.execute('SELECT nombre_completo FROM empleados WHERE id = ?', (emp_id,)).fetchone()
+            empleados_info[emp_id] = emp['nombre_completo'] if emp else f"ID {emp_id}"
+        
+        print(f"🎯 INICIANDO EVENTO: {codigo_asistencia} del {fecha_desde} al {fecha_hasta}")
+        print(f"👥 Empleados: {empleados_info}")
+        
+        # Lógica de códigos
+        codigos_basicos = ['T', 'D']
+        codigos_importantes = ['V', 'LM', 'PP', 'PNP', 'MUT', 'PSN', 'PF']
+        
+        # Obtener registros existentes
+        empleados_str = ','.join(str(id) for id in empleados_ids)
+        registros_existentes = conn.execute(f"""
+            SELECT empleado_id, fecha, codigo_asistencia_id 
+            FROM asistencia 
+            WHERE empleado_id IN ({empleados_str}) 
+            AND fecha BETWEEN ? AND ?
+        """, (fecha_desde, fecha_hasta)).fetchall()
+        
+        registros_dict = {}
+        for reg in registros_existentes:
+            key = f"{reg['empleado_id']}-{reg['fecha']}"
+            registros_dict[key] = reg['codigo_asistencia_id']
+        
+        print(f"📋 Registros existentes: {len(registros_existentes)}")
+        
+        # Procesar cada día
+        registros_para_procesar = []
+        estadisticas = {'creados': 0, 'sobrescritos_basicos': 0, 'sobrescritos_especiales': 0, 'omitidos': 0}
+        
+        fecha_actual = fecha_inicio
+        while fecha_actual <= fecha_fin:
+            fecha_str = fecha_actual.strftime('%Y-%m-%d')
+            
+            for empleado_id in empleados_ids:
+                key = f"{empleado_id}-{fecha_str}"
+                codigo_existente = registros_dict.get(key)
+                
+                debe_procesar = True
+                
+                if codigo_existente:
+                    if codigo_existente in codigos_basicos:
+                        debe_procesar = True
+                        estadisticas['sobrescritos_basicos'] += 1
+                    elif codigo_existente in codigos_importantes:
+                        debe_procesar = sobrescribir
+                        if sobrescribir:
+                            estadisticas['sobrescritos_especiales'] += 1
+                        else:
+                            estadisticas['omitidos'] += 1
+                    else:
+                        debe_procesar = sobrescribir
+                        if not sobrescribir:
+                            estadisticas['omitidos'] += 1
+                else:
+                    estadisticas['creados'] += 1
+                
+                if debe_procesar:
+                    registros_para_procesar.append((empleado_id, fecha_str, codigo_asistencia))
+            
+            fecha_actual += timedelta(days=1)
+        
+        print(f"📊 Estadísticas de procesamiento: {estadisticas}")
+        print(f"✅ Registros a procesar: {len(registros_para_procesar)}")
+        
+        if not registros_para_procesar:
+            conn.close()
+            return jsonify({
+                'status': 'warning',
+                'message': 'No hay registros para procesar',
+                'estadisticas': estadisticas
+            })
+        
+        # OPERACIÓN DE BASE DE DATOS MÁS ROBUSTA
+        try:
+            cursor = conn.cursor()
+            
+            # Método más directo: usar REPLACE en lugar de DELETE+INSERT
+            registros_procesados = 0
+            for empleado_id, fecha_str, codigo in registros_para_procesar:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO asistencia (empleado_id, fecha, codigo_asistencia_id) 
+                    VALUES (?, ?, ?)
+                """, (empleado_id, fecha_str, codigo))
+                registros_procesados += 1
+            
+            conn.commit()
+            
+            # VERIFICACIÓN POST-INSERCIÓN
+            print("🔍 VERIFICANDO INSERCIÓN...")
+            for i, (empleado_id, fecha_str, codigo) in enumerate(registros_para_procesar[:5]):  # Solo primeros 5
+                verificacion = conn.execute(
+                    "SELECT codigo_asistencia_id FROM asistencia WHERE empleado_id = ? AND fecha = ?",
+                    (empleado_id, fecha_str)
+                ).fetchone()
+                
+                if verificacion:
+                    print(f"✅ {empleado_id}-{fecha_str}: {verificacion['codigo_asistencia_id']}")
+                else:
+                    print(f"❌ {empleado_id}-{fecha_str}: NO ENCONTRADO")
+            
+            conn.close()
+            
+            # Estadísticas finales
+            dias_totales = (fecha_fin - fecha_inicio).days + 1
+            
+            return jsonify({
+                'status': 'success',
+                'message': f'Evento {codigo_asistencia} aplicado exitosamente.',
+                'detalles': {
+                    'codigo': codigo_asistencia,
+                    'periodo': f'{fecha_desde} al {fecha_hasta}',
+                    'dias': dias_totales,
+                    'empleados': len(empleados_ids),
+                    'registros_procesados': registros_procesados,
+                    'empleados_info': list(empleados_info.values()),
+                    'estadisticas': estadisticas,
+                    'debug_url': f'/debug_asistencia/{empleados_ids[0]}/{fecha_inicio.year}/{fecha_inicio.month}'
+                }
+            })
+            
+        except Exception as db_error:
+            conn.rollback()
+            conn.close()
+            print(f"💥 ERROR DE BASE DE DATOS: {db_error}")
+            raise db_error
+        
+    except Exception as e:
+        import traceback
+        print("💥 ERROR GENERAL:")
+        print(traceback.format_exc())
+        return jsonify({
+            'status': 'error',
+            'message': f'Error: {str(e)}'
+        }), 500
+
+# 1. AGREGAR ESTA RUTA DE DIAGNÓSTICO en app.py para verificar qué se guardó:
+
+@app.route('/debug_asistencia/<int:empleado_id>/<int:ano>/<int:mes>')
+def debug_asistencia(empleado_id, ano, mes):
+    """Ruta para debuggear qué se guardó realmente en la base de datos"""
+    conn = get_db_connection()
+    
+    # Obtener info del empleado
+    empleado = conn.execute(
+        'SELECT nombre_completo, rut FROM empleados WHERE id = ?', 
+        (empleado_id,)
+    ).fetchone()
+    
+    if not empleado:
+        return f"Empleado ID {empleado_id} no encontrado"
+    
+    # Obtener todos los registros del mes
+    registros = conn.execute(
+        '''SELECT fecha, codigo_asistencia_id 
+           FROM asistencia 
+           WHERE empleado_id = ? AND strftime('%Y-%m', fecha) = ?
+           ORDER BY fecha''',
+        (empleado_id, f'{ano:04d}-{mes:02d}')
+    ).fetchall()
+    
+    conn.close()
+    
+    html = f"""
+    <h2>DEBUG - Asistencia en BD</h2>
+    <p><strong>Empleado:</strong> {empleado['nombre_completo']} (ID: {empleado_id})</p>
+    <p><strong>RUT:</strong> {empleado['rut']}</p>
+    <p><strong>Mes:</strong> {mes}/{ano}</p>
+    <p><strong>Registros encontrados:</strong> {len(registros)}</p>
+    
+    <table border="1" style="border-collapse: collapse; margin-top: 20px;">
+        <tr style="background-color: #f0f0f0;">
+            <th style="padding: 8px;">Fecha</th>
+            <th style="padding: 8px;">Código</th>
+        </tr>
+    """
+    
+    for reg in registros:
+        color = {
+            'V': '#dbeafe', 'T': '#d1fae5', 'D': '#e5e7eb', 
+            'F': '#fee2e2', 'LM': '#fef3c7'
+        }.get(reg['codigo_asistencia_id'], '#ffffff')
+        
+        html += f"""
+        <tr style="background-color: {color};">
+            <td style="padding: 8px;">{reg['fecha']}</td>
+            <td style="padding: 8px; font-weight: bold;">{reg['codigo_asistencia_id']}</td>
+        </tr>
+        """
+    
+    html += """
+    </table>
+    <br>
+    <a href="javascript:history.back()">← Volver</a>
+    """
+    
+    return html
+    
+# REEMPLAZAR en tu app.py - Función reporte_asistencia() corregida
+@app.route('/reporte_asistencia')
+def reporte_asistencia():
+    import datetime as _dt
+
+    # --- Parámetros de fechas (con valores por defecto sanos) ---
+    hoy_date = _dt.date.today()
+    primer_dia_mes = hoy_date.replace(day=1)
+
+    fecha_desde_str = request.args.get('fecha_desde', primer_dia_mes.strftime('%Y-%m-%d'))
+    fecha_hasta_str = request.args.get('fecha_hasta', hoy_date.strftime('%Y-%m-%d'))
+    query = request.args.get('query')
+
+    # Normaliza y corrige si vienen invertidas
+    try:
+        fecha_desde_obj = _dt.datetime.strptime(fecha_desde_str, '%Y-%m-%d').date()
+        fecha_hasta_obj = _dt.datetime.strptime(fecha_hasta_str, '%Y-%m-%d').date()
+    except ValueError:
+        fecha_desde_obj, fecha_hasta_obj = primer_dia_mes, hoy_date
+        fecha_desde_str = fecha_desde_obj.strftime('%Y-%m-%d')
+        fecha_hasta_str = fecha_hasta_obj.strftime('%Y-%m-%d')
+
+    if fecha_desde_obj > fecha_hasta_obj:
+        fecha_desde_obj, fecha_hasta_obj = fecha_hasta_obj, fecha_desde_obj
+        fecha_desde_str = fecha_desde_obj.strftime('%Y-%m-%d')
+        fecha_hasta_str = fecha_hasta_obj.strftime('%Y-%m-%d')
+
+    # *** FIX: Definir dias_rango INMEDIATAMENTE después de las fechas ***
+    dias_rango = [
+        fecha_desde_obj + _dt.timedelta(days=d)
+        for d in range((fecha_hasta_obj - fecha_desde_obj).days + 1)
+    ]
+
+    # *** FIX: Definir días en formato chileno para JS inmediatamente ***
+    dias_rango_iso = [d.strftime('%d-%m-%Y') for d in dias_rango]
+
+    conn = get_db_connection()
+    try:
+        # Mapa rápido id -> nombre
+        mapa_empleados_raw = conn.execute(
+            "SELECT id, nombre_completo FROM empleados"
+        ).fetchall()
+        mapa_empleados = {row['id']: row['nombre_completo'] for row in mapa_empleados_raw}
+
+        # --- Empleados con relación laboral vigente en algún momento del rango ---
+        empleados_en_rango = conn.execute(
+            """
+            SELECT
+                e.id,
+                e.nombre_completo,
+                e.rut,
+                COALESCE(t.nombre, '') AS turno_nombre,
+                e.fecha_egreso
+            FROM empleados e
+            LEFT JOIN turnos t ON e.turno_id = t.id
+            WHERE e.fecha_ingreso <= ?
+              AND (e.fecha_egreso IS NULL OR e.fecha_egreso >= ?)
+            ORDER BY e.nombre_completo
+            """,
+            (fecha_hasta_str, fecha_desde_str)
+        ).fetchall()
+
+        empleado_ids = [e['id'] for e in empleados_en_rango]
+        total_empleados_periodo = len(empleados_en_rango)
+
+        total_finiquitados_periodo = conn.execute(
+            "SELECT COUNT(id) AS c FROM empleados WHERE fecha_egreso BETWEEN ? AND ?",
+            (fecha_desde_str, fecha_hasta_str)
+        ).fetchone()['c'] if total_empleados_periodo > 0 else 0
+
+        total_vigentes_periodo = max(total_empleados_periodo - total_finiquitados_periodo, 0)
+
+        # Empleados finiquitados dentro del período solicitado (para chip rojo)
+        finiquitos_mes = {}  # {empleado_id: 'DD-MM-YYYY'}
+        for e in empleados_en_rango:
+            eg = e['fecha_egreso']
+            if eg and (fecha_desde_str <= eg <= fecha_hasta_str):
+                finiquitos_mes[e['id']] = _dt.datetime.strptime(eg, '%Y-%m-%d').date().strftime('%d-%m-%Y')
+
+        # --- Dashboard: resumen del último día del rango (fecha_hasta) ---
+        # Solo empleados VIGENTES al día fecha_hasta y excluimos FQTO del conteo
+        exclude_codigos = ('FQTO',)  # agrega más si quieres excluir otros
+        placeholders_exc = ','.join('?' * len(exclude_codigos)) if exclude_codigos else ''
+        filtro_exc = f"AND a.codigo_asistencia_id NOT IN ({placeholders_exc})" if exclude_codigos else ''
+
+        sql_dashboard = f"""
+            SELECT a.codigo_asistencia_id, COUNT(DISTINCT a.empleado_id) AS total
+            FROM asistencia a
+            JOIN empleados e ON e.id = a.empleado_id
+            WHERE a.fecha = ?
+            AND e.fecha_ingreso <= ?
+            AND (e.fecha_egreso IS NULL OR e.fecha_egreso >= ?)
+            {filtro_exc}
+            GROUP BY a.codigo_asistencia_id
+        """
+
+        params_dash = [fecha_hasta_str, fecha_hasta_str, fecha_hasta_str]
+        if exclude_codigos:
+            params_dash += list(exclude_codigos)
+
+        asistencia_ultimo_dia_raw = conn.execute(sql_dashboard, params_dash).fetchall()
+
+        resumen_ultimo_dia = {row['codigo_asistencia_id']: row['total']
+                            for row in asistencia_ultimo_dia_raw}
+
+        total_empleados_en_dashboard = sum(resumen_ultimo_dia.values())
+
+        distribucion_estados = []
+        if total_empleados_en_dashboard > 0:
+            for codigo, count in resumen_ultimo_dia.items():
+                distribucion_estados.append({
+                    'codigo': codigo,
+                    'conteo': count,
+                    'porcentaje': (count / total_empleados_en_dashboard) * 100.0
+                })
+            distribucion_estados.sort(key=lambda x: x['porcentaje'], reverse=True)
+        else:
+            distribucion_estados = []       
+
+        # --- Ranking de ausentismo en el rango (top 7 + total) ---
+        ranking_ausentes = []
+        total_ausentes_acumulado = 0
+        codigos_ausentismo = ('F', 'LM', 'PNP', 'MUT')
+
+        if empleado_ids:
+            placeholders_ids = ','.join('?' * len(empleado_ids))
+            placeholders_cod = ','.join('?' * len(codigos_ausentismo))
+
+            registros_ausentes = conn.execute(
+                f"""
+                SELECT empleado_id, COUNT(*) AS total_ausencias
+                FROM asistencia
+                WHERE empleado_id IN ({placeholders_ids})
+                  AND codigo_asistencia_id IN ({placeholders_cod})
+                  AND fecha BETWEEN ? AND ?
+                GROUP BY empleado_id
+                ORDER BY total_ausencias DESC
+                LIMIT 7
+                """,
+                (*empleado_ids, *codigos_ausentismo, fecha_desde_str, fecha_hasta_str)
+            ).fetchall()
+
+            for reg in registros_ausentes:
+                ranking_ausentes.append({
+                    'nombre': mapa_empleados.get(reg['empleado_id'], f"ID {reg['empleado_id']}"),
+                    'faltas': reg['total_ausencias']
+                })
+
+            total_ausentes_acumulado = conn.execute(
+                f"""
+                SELECT COUNT(*) AS c
+                FROM asistencia
+                WHERE empleado_id IN ({placeholders_ids})
+                  AND codigo_asistencia_id IN ({placeholders_cod})
+                  AND fecha BETWEEN ? AND ?
+                """,
+                (*empleado_ids, *codigos_ausentismo, fecha_desde_str, fecha_hasta_str)
+            ).fetchone()['c']
+
+        # --- Grid de asistencia día a día para la tabla ---
+        asistencia_grid = {emp_id: {} for emp_id in empleado_ids}
+
+        if empleado_ids:
+            asistencias_rango_tabla = conn.execute(
+                """
+                SELECT empleado_id, fecha, codigo_asistencia_id
+                FROM asistencia
+                WHERE fecha BETWEEN ? AND ?
+                  AND empleado_id IN ({})
+                """.format(','.join('?' * len(empleado_ids))),
+                (fecha_desde_str, fecha_hasta_str, *empleado_ids)
+            ).fetchall()
+
+            for row in asistencias_rango_tabla:
+                emp_id = row['empleado_id']
+                raw = row['fecha']
+                # Parseo robusto: acepta str 'YYYY-MM-DD', date o datetime
+                if isinstance(raw, str):
+                    try:
+                        fobj = _dt.datetime.strptime(raw, '%Y-%m-%d').date()
+                    except ValueError:
+                        continue
+                else:
+                    try:
+                        fobj = raw.date() if hasattr(raw, 'date') else raw
+                    except Exception:
+                        continue
+
+                if fecha_desde_obj <= fobj <= fecha_hasta_obj:
+                    asistencia_grid[emp_id][fobj.day] = row['codigo_asistencia_id']
+
+        # --- Resumen de asistencia por empleado dentro del rango (BACKEND, sin duplicaciones) ---
+        resumen_por_empleado = {emp_id: {} for emp_id in empleado_ids}
+
+        if empleado_ids:
+            placeholders_ids = ','.join(['?'] * len(empleado_ids))
+            sql_resumen = f"""
+                SELECT empleado_id,
+                       codigo_asistencia_id AS codigo,
+                       COUNT(*) AS c
+                FROM asistencia
+                WHERE empleado_id IN ({placeholders_ids})
+                  AND fecha BETWEEN ? AND ?
+                GROUP BY empleado_id, codigo_asistencia_id
+            """
+            filas_resumen = conn.execute(
+                sql_resumen, (*empleado_ids, fecha_desde_str, fecha_hasta_str)
+            ).fetchall()
+
+            for r in filas_resumen:
+                emp = r['empleado_id']
+                cod = r['codigo']
+                resumen_por_empleado.setdefault(emp, {})
+                resumen_por_empleado[emp][cod] = r['c']
+
+        # ===== FUTUROS PERMISOS/LICENCIAS (avisar si hay algo DESPUÉS de fecha_hasta) =====
+        codigos_futuro = ('LM', 'V', 'PNP', 'PSN', 'MUT', 'PF')
+        ventana_extra_dias = 160
+        futuros_permisos = {}
+        today = _dt.date.today()
+
+        if empleados_en_rango:
+            emp_ids = [e['id'] for e in empleados_en_rango]
+            if emp_ids:
+                placeholders_emp = ','.join('?' for _ in emp_ids)
+                placeholders_cod = ','.join('?' for _ in codigos_futuro)
+
+                margen_atras_dias = 31
+                inicio_consulta = min(fecha_desde_obj, fecha_hasta_obj - _dt.timedelta(days=margen_atras_dias))
+                fin_consulta = fecha_hasta_obj + _dt.timedelta(days=ventana_extra_dias)
+
+                inicio_str = inicio_consulta.strftime('%Y-%m-%d')
+                fin_str = fin_consulta.strftime('%Y-%m-%d')
+
+                sql_futuros = f"""
+                    SELECT empleado_id,
+                           codigo_asistencia_id AS codigo,
+                           fecha
+                    FROM asistencia
+                    WHERE empleado_id IN ({placeholders_emp})
+                      AND fecha BETWEEN ? AND ?
+                      AND codigo_asistencia_id IN ({placeholders_cod})
+                    ORDER BY empleado_id, codigo_asistencia_id, fecha
+                """
+                filas = conn.execute(
+                    sql_futuros, (*emp_ids, inicio_str, fin_str, *codigos_futuro)
+                ).fetchall()
+
+                # Agrupar por empleado/código en bloques de días consecutivos
+                def _agrupa_consecutivos(fechas_ordenadas):
+                    if not fechas_ordenadas:
+                        return []
+                    bloques = []
+                    inicio = prev = fechas_ordenadas[0]
+                    for d in fechas_ordenadas[1:]:
+                        if d == prev + _dt.timedelta(days=1):
+                            prev = d
+                        else:
+                            bloques.append((inicio, prev))
+                            inicio = prev = d
+                    bloques.append((inicio, prev))
+                    return bloques
+
+                from collections import defaultdict
+                fechas_por_emp_cod = defaultdict(lambda: defaultdict(list))
+                for r in filas:
+                    emp = r['empleado_id']
+                    cod = r['codigo']
+                    f = _dt.datetime.strptime(r['fecha'], '%Y-%m-%d').date()
+                    fechas_por_emp_cod[emp][cod].append(f)
+
+                # Bloques solo si tienen parte FUTURA (fin > fecha_hasta)
+                for emp, por_cod in fechas_por_emp_cod.items():
+                    res_emp = []
+                    for cod, fechas in por_cod.items():
+                        fechas.sort()
+                        for d1, d2 in _agrupa_consecutivos(fechas):
+                            if d2 > fecha_hasta_obj:
+                                res_emp.append({
+                                    'codigo': cod,
+                                    'desde': d1.strftime('%d-%m-%Y'),
+                                    'hasta': d2.strftime('%d-%m-%Y'),
+                                })
+                    res_emp.sort(key=lambda x: _dt.datetime.strptime(x['desde'], '%d-%m-%Y').date())
+                    if res_emp:
+                        futuros_permisos[emp] = res_emp
+
+        # --- Totales generales a mostrar ---
+        total_distribucion = total_empleados_en_dashboard
+
+        # --- Feriados (placeholder) ---
+        dias_festivos = {'2025-01-01', '2025-05-01', '2025-09-18', '2025-09-19', '2025-12-25'}
+
+        # --- Ranking (modo histórico o mensual) ---
+        modo = request.args.get('modo', 'historico')
+
+        if modo == 'mensual':
+            mes_inicio = fecha_hasta_obj.replace(day=1)
+            mes_siguiente = (mes_inicio.replace(day=28) + _dt.timedelta(days=4)).replace(day=1)
+            mes_fin = mes_siguiente - _dt.timedelta(days=1)
+
+            registros_ausentes = conn.execute(
+                """
+                SELECT e.id AS empleado_id, e.nombre_completo, COUNT(*) AS total_ausencias
+                FROM empleados e
+                JOIN asistencia a ON a.empleado_id = e.id
+                WHERE a.codigo_asistencia_id IN (?, ?, ?, ?)
+                  AND a.fecha BETWEEN ? AND ?
+                  AND e.fecha_ingreso <= ?
+                  AND (e.fecha_egreso IS NULL OR e.fecha_egreso >= ?)
+                GROUP BY e.id, e.nombre_completo
+                ORDER BY total_ausencias DESC
+                LIMIT 7
+                """,
+                ('F','LM','PNP','MUT',
+                 mes_inicio.strftime('%Y-%m-%d'), mes_fin.strftime('%Y-%m-%d'),
+                 mes_fin.strftime('%Y-%m-%d'), mes_inicio.strftime('%Y-%m-%d'))
+            ).fetchall()
+
+            total_ausentes_acumulado = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM empleados e
+                JOIN asistencia a ON a.empleado_id = e.id
+                WHERE a.codigo_asistencia_id IN (?, ?, ?, ?)
+                  AND a.fecha BETWEEN ? AND ?
+                  AND e.fecha_ingreso <= ?
+                  AND (e.fecha_egreso IS NULL OR e.fecha_egreso >= ?)
+                """,
+                ('F','LM','PNP','MUT',
+                 mes_inicio.strftime('%Y-%m-%d'), mes_fin.strftime('%Y-%m-%d'),
+                 mes_fin.strftime('%Y-%m-%d'), mes_inicio.strftime('%Y-%m-%d'))
+            ).fetchone()['c']
+        else:
+            registros_ausentes = conn.execute(
+                """
+                SELECT e.id AS empleado_id, e.nombre_completo, COUNT(*) AS total_ausencias
+                FROM empleados e
+                JOIN asistencia a ON a.empleado_id = e.id
+                WHERE a.codigo_asistencia_id IN (?, ?, ?, ?)
+                  AND a.fecha >= e.fecha_ingreso
+                  AND (e.fecha_egreso IS NULL OR a.fecha <= e.fecha_egreso)
+                GROUP BY e.id, e.nombre_completo
+                ORDER BY total_ausencias DESC
+                LIMIT 7
+                """,
+                ('F','LM','PNP','MUT')
+            ).fetchall()
+
+            total_ausentes_acumulado = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM empleados e
+                JOIN asistencia a ON a.empleado_id = e.id
+                WHERE a.codigo_asistencia_id IN (?, ?, ?, ?)
+                  AND a.fecha >= e.fecha_ingreso
+                  AND (e.fecha_egreso IS NULL OR a.fecha <= e.fecha_egreso)
+                """,
+                ('F','LM','PNP','MUT')
+            ).fetchone()['c']
+
+        ranking_ausentes = [
+            {'nombre': r['nombre_completo'], 'faltas': r['total_ausencias']}
+            for r in registros_ausentes
+        ]
+
+        # --- Render ---
+        return render_template(
+            'reporte_asistencia.html',
+            empleados=empleados_en_rango,
+            dias_rango=dias_rango,  # ✅ YA DEFINIDA
+            dias_rango_iso=dias_rango_iso,  # ✅ YA DEFINIDA  
+            asistencia_grid=asistencia_grid,
+            fecha_desde=fecha_desde_str,
+            fecha_hasta=fecha_hasta_str,
+            total_vigentes=total_vigentes_periodo,
+            total_finiquitados=total_finiquitados_periodo,
+            resumen_ultimo_dia=resumen_ultimo_dia,
+            distribucion_estados=distribucion_estados[:4],
+            ranking_faltas=ranking_ausentes,
+            finiquitos_mes=finiquitos_mes,
+            resumen_por_empleado=resumen_por_empleado,
+            total_faltas=total_ausentes_acumulado,
+            total_distribucion=total_empleados_en_dashboard,
+            today=today,
+            dias_festivos=dias_festivos,
+            futuros_permisos=futuros_permisos,
+            query=query
+        )
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/exportar_reporte_parcial')
+def exportar_reporte_parcial():
+    fecha_desde = request.args.get('fecha_desde')
+    fecha_hasta = request.args.get('fecha_hasta')
+    query = request.args.get('query')
+
+    fecha_desde_obj = datetime.strptime(fecha_desde, '%Y-%m-%d').date()
+    fecha_hasta_obj = datetime.strptime(fecha_hasta, '%Y-%m-%d').date()
+    
+    conn = get_db_connection()
+    
+    sql_empleados = '''
+        SELECT e.*, 
+            g.nombre as genero, n.pais as nacionalidad, c.nombre as cargo, t.nombre as turno,
+            co.comuna, r.region, tc.nombre as tipo_contrato, nom.nombre as nomina,
+            rl.nombre as relacion_laboral, ac.nombre as acreditacion, ar.nombre as area,
+            fa.nombre as fase, dc.nombre as distribucion_categoria, s.nombre as supervision,
+            st.nombre as status, cd.nombre_causal as causal_despido
+        FROM empleados e
+        LEFT JOIN generos g ON e.genero_id = g.id
+        LEFT JOIN nacionalidades n ON e.nacionalidad_id = n.id
+        LEFT JOIN cargos c ON e.cargo_id = c.id
+        LEFT JOIN turnos t ON e.turno_id = t.id
+        LEFT JOIN comunas co ON e.comuna_id = co.id
+        LEFT JOIN regiones r ON e.region_id = r.id
+        LEFT JOIN tipos_contrato tc ON e.tipo_contrato_id = tc.id
+        LEFT JOIN nominas nom ON e.nomina_id = nom.id
+        LEFT JOIN relaciones_laborales rl ON e.relacion_laboral_id = rl.id
+        LEFT JOIN acreditaciones ac ON e.acreditacion_id = ac.id
+        LEFT JOIN areas ar ON e.area_id = ar.id
+        LEFT JOIN fases fa ON e.fase_id = fa.id
+        LEFT JOIN distribucion_categorias dc ON e.distribucion_categoria_id = dc.id
+        LEFT JOIN supervisiones s ON e.supervision_id = s.id
+        LEFT JOIN status_empleado st ON e.status_id = st.id
+        LEFT JOIN causales_despido cd ON e.causal_despido_id = cd.id
+        WHERE e.fecha_ingreso <= ? AND (e.fecha_egreso >= ? OR e.fecha_egreso IS NULL)
+    '''
+    params = [fecha_hasta, fecha_desde]
+    if query:
+        sql_empleados += " AND (e.nombre_completo LIKE ? OR e.rut LIKE ? OR e.id_sap_local LIKE ?)"
+        params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+    sql_empleados += ' ORDER BY e.nombre_completo'
+    
+    df_empleados = pd.DataFrame([dict(row) for row in conn.execute(sql_empleados, params).fetchall()])
+    
+    if df_empleados.empty:
+        flash('No hay empleados para exportar con los filtros actuales.', 'error')
+        return redirect(url_for('reporte_asistencia', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, query=query))
+
+    # Calcular edad
+    fecha_actual = datetime.now()
+    df_empleados['edad'] = df_empleados['fecha_nacimiento'].apply(lambda x: 
+        (fecha_actual - datetime.strptime(x, '%Y-%m-%d')).days // 365 if pd.notna(x) and x else None
+    )
+
+    # Convertir fechas al formato chileno
+    columnas_fecha = ['fecha_nacimiento', 'fecha_ingreso', 'fecha_egreso']
+    for col in columnas_fecha:
+        if col in df_empleados.columns:
+            df_empleados[col] = pd.to_datetime(df_empleados[col], errors='coerce').dt.strftime('%d-%m-%Y')
+
+    # Obtener asistencias solo del rango
+    asistencias_rango = conn.execute(
+        "SELECT empleado_id, fecha, codigo_asistencia_id FROM asistencia WHERE fecha BETWEEN ? AND ?",
+        (fecha_desde, fecha_hasta)
+    ).fetchall()
+    conn.close()
+
+    # Formatear fechas
+    asistencias_formateadas = []
+    for asist in asistencias_rango:
+        fecha_obj = datetime.strptime(asist['fecha'], '%Y-%m-%d')
+        fecha_formato_chileno = fecha_obj.strftime('%d-%m-%Y')
+        asistencias_formateadas.append({
+            'id': asist['empleado_id'],
+            'fecha': fecha_formato_chileno,
+            'codigo': asist['codigo_asistencia_id']
+        })
+
+    if asistencias_formateadas:
+        asistencia_pivot = pd.DataFrame(asistencias_formateadas).pivot(index='id', columns='fecha', values='codigo').reset_index()
+        df_final = pd.merge(df_empleados, asistencia_pivot, on='id', how='left')
+    else:
+        df_final = df_empleados
+    
+    columnas_a_borrar = [col for col in df_final.columns if col.endswith('_id')]
+    df_final = df_final.drop(columns=columnas_a_borrar)
+
+    # Reordenar columnas
+    columnas_ordenadas = []
+    for col in df_final.columns:
+        columnas_ordenadas.append(col)
+        if col == 'nombre_completo':
+            columnas_ordenadas.append('edad')
+    
+    if 'edad' in columnas_ordenadas:
+        columnas_ordenadas = [col for col in columnas_ordenadas if col != 'edad' or columnas_ordenadas[columnas_ordenadas.index(col)-1] == 'nombre_completo']
+    
+    df_final = df_final[columnas_ordenadas]
+
+    output = io.BytesIO()
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    df_final.to_excel(writer, index=False, sheet_name=f'Reporte_{fecha_desde_obj.strftime("%d-%m")}_{fecha_hasta_obj.strftime("%d-%m")}')
+    writer.close()
+    output.seek(0)
+    
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f'reporte_asistencia_{fecha_desde_obj.strftime("%d-%m")}_{fecha_hasta_obj.strftime("%d-%m")}.xlsx'
+    )
+
+# === SISTEMA FINAL - REPORTE GENERAL INCLUYE HORAS + DÍAS EN EXCEL ===
+
+def convertir_fecha_chilena_a_iso(fecha_chilena):
+    """Convierte fecha DD-MM-YYYY a YYYY-MM-DD"""
+    if not fecha_chilena:
+        return None
+    
+    try:
+        # Si viene en formato chileno DD-MM-YYYY
+        if '-' in fecha_chilena and len(fecha_chilena.split('-')) == 3:
+            partes = fecha_chilena.split('-')
+            if len(partes[2]) == 4:  # Es formato chileno DD-MM-YYYY
+                dia = partes[0].zfill(2)
+                mes = partes[1].zfill(2) 
+                año = partes[2]
+                return f"{año}-{mes}-{dia}"
+        
+        # Si ya viene en formato ISO YYYY-MM-DD, devolverlo tal cual
+        return fecha_chilena
+        
+    except Exception as e:
+        print(f"Error convirtiendo fecha {fecha_chilena}: {e}")
+        return None
+
+def convertir_fecha_iso_a_chilena(fecha_iso):
+    """Convierte fecha YYYY-MM-DD a DD-MM-YYYY"""
+    if not fecha_iso:
+        return None
+    
+    try:
+        if isinstance(fecha_iso, str) and '-' in fecha_iso:
+            partes = fecha_iso.split('-')
+            if len(partes) == 3 and len(partes[0]) == 4:  # Es formato ISO YYYY-MM-DD
+                año = partes[0]
+                mes = partes[1].lstrip('0') or '1'  # Remover ceros iniciales
+                dia = partes[2].lstrip('0') or '1'
+                return f"{dia}-{mes}-{año}"
+        
+        return fecha_iso
+        
+    except Exception as e:
+        print(f"Error convirtiendo fecha ISO {fecha_iso}: {e}")
+        return None
+
+
+def _construir_asistencia_completa(conn, filters):
+    """
+    Función base que construye los datos completos.
+    """
+    date_from = filters['date_from']
+    date_to = filters['date_to']
+    codigo_filtro = filters.get('codigo_filtro')
+    area_id = filters.get('area_id')
+    
+    empleados_a_incluir_sql = ""
+    area_filter = ""
+    
+    # Filtro por código específico
+    if codigo_filtro and codigo_filtro != 'todos':
+        empleados_a_incluir_sql = f"""
+            AND e.id IN (
+                SELECT DISTINCT a_filter.empleado_id
+                FROM asistencia a_filter
+                WHERE a_filter.fecha BETWEEN '{date_from}' AND '{date_to}'
+                AND a_filter.codigo_asistencia_id = '{codigo_filtro}'
+            )
+        """
+
+    # Filtro por área
+    if area_id:
+        area_filter = f"AND e.area_id = {area_id}"
+
+    # Consulta principal
+    sql = f"""
+        WITH RECURSIVE dates(date) AS (
+            VALUES('{date_from}')
+            UNION ALL
+            SELECT date(date, '+1 day')
+            FROM dates
+            WHERE date < '{date_to}'
+        ),
+        empleados_activos AS (
+            SELECT 
+                e.id, e.rut, e.id_sap_local, e.nombre_completo, e.turno_id,
+                e.fecha_ingreso, e.fecha_egreso,
+                ar.nombre as area, c.nombre as cargo, t.nombre as turno
+            FROM empleados e
+            LEFT JOIN areas ar ON e.area_id = ar.id
+            LEFT JOIN cargos c ON e.cargo_id = c.id
+            LEFT JOIN turnos t ON e.turno_id = t.id
+            WHERE e.fecha_ingreso <= '{date_to}' 
+              AND (e.fecha_egreso >= '{date_from}' OR e.fecha_egreso IS NULL)
+              {area_filter}
+              {empleados_a_incluir_sql}
+        )
+        SELECT
+            ea.rut, ea.id_sap_local, ea.nombre_completo, ea.area, ea.cargo, ea.turno,
+            d.date as fecha,
+            COALESCE(
+                (SELECT a.codigo_asistencia_id FROM asistencia a WHERE a.empleado_id = ea.id AND a.fecha = d.date),
+                (SELECT ct.codigo FROM calendario_turnos ct WHERE ct.turno_id = ea.turno_id AND ct.fecha = d.date),
+                ''
+            ) as codigo
+        FROM empleados_activos ea
+        CROSS JOIN dates d
+        WHERE d.date >= ea.fecha_ingreso 
+          AND (d.date <= ea.fecha_egreso OR ea.fecha_egreso IS NULL)
+    """
+    
+    try:
+        result = conn.execute(sql).fetchall()
+        df = pd.DataFrame([dict(row) for row in result])
+        
+        if not df.empty:
+            df = df[df['codigo'] != ''].copy()
+        
+        print(f"DEBUG: Query ejecutada, resultados: {len(df)} filas")
+        return df
+        
+    except Exception as e:
+        print(f"ERROR en consulta: {e}")
+        return pd.DataFrame()
+
+def generar_reporte_general_con_horas(conn, filters, pagina=1, por_pagina=30, solo_conteo=False):
+    """
+    Reporte general QUE INCLUYE cálculo de horas automáticamente.
+    Ahora con paginación para la web.
+    """
+    try:
+        df_completo = _construir_asistencia_completa(conn, filters)
+        if df_completo.empty: 
+            print("DEBUG: DataFrame vacío en reporte general")
+            return None, None, 0, 0
+
+        # Crear pivot table
+        df_pivot = df_completo.pivot_table(
+            index=['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno'],
+            columns='codigo', values='rut', aggfunc='count', fill_value=0
+        )
+        
+        codigos_asistencia = [col for col in df_pivot.columns]
+        codigos_ausentismo = [c for c in codigos_asistencia if c not in ['T', 'D']]
+        
+        # Calcular métricas básicas
+        df_pivot['Total Ausentismo'] = df_pivot[codigos_ausentismo].sum(axis=1) if codigos_ausentismo else 0
+        df_pivot.rename(columns={'T': 'Días Trabajados', 'D': 'Días Descanso'}, inplace=True)
+        
+        for col in ['Días Trabajados', 'Días Descanso']:
+            if col not in df_pivot: 
+                df_pivot[col] = 0
+
+        df_pivot['Total Días Laborales'] = df_pivot['Días Trabajados'] + df_pivot['Total Ausentismo']
+        
+        # Porcentajes
+        df_pivot['% Presentismo'] = (df_pivot['Días Trabajados'].divide(df_pivot['Total Días Laborales'].replace(0, 1)).fillna(0) * 100).map('{:.1f}%'.format)
+        df_pivot['% Ausentismo'] = (df_pivot['Total Ausentismo'].divide(df_pivot['Total Días Laborales'].replace(0, 1)).fillna(0) * 100).map('{:.1f}%'.format)
+        
+        # Cálculo de horas
+        def calcular_horas_por_turno(row):
+            turno = str(row.name[5]).strip().lower() if pd.notna(row.name[5]) else ""
+            dias_trabajados = row['Días Trabajados']
+            
+            if any(t in turno for t in ['14x14', '15x13']):
+                return dias_trabajados * 11
+            elif any(t in turno for t in ['6x1', '21x7']):
+                return dias_trabajados * (44 / 6)
+            elif any(t in turno for t in ['5x2', '9x5']):
+                return dias_trabajados * (44 / 5)
+            elif any(t in turno for t in ['12x12']):
+                return dias_trabajados * 12
+            else:
+                return dias_trabajados * 8
+
+        df_pivot['Total Horas'] = df_pivot.apply(calcular_horas_por_turno, axis=1).round(2)
+        
+        # Organizar columnas finales
+        columnas_base = [
+            'Días Trabajados', 'Días Descanso', 'Total Ausentismo', 
+            'Total Días Laborales', 'Total Horas',
+            '% Presentismo', '% Ausentismo'
+        ]
+        
+        columnas_codigos = sorted([col for col in df_pivot.columns 
+                                 if col not in columnas_base + ['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno']])
+        
+        columnas_finales = columnas_base + columnas_codigos
+        
+        for col in columnas_finales:
+            if col not in df_pivot: 
+                df_pivot[col] = 0
+                
+        df_final = df_pivot.reset_index()
+        df_final = df_final[['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno'] + columnas_finales]
+        
+        # *** NUEVA LÓGICA DE PAGINACIÓN ***
+        total_registros = len(df_final)
+        total_paginas = math.ceil(total_registros / por_pagina) if por_pagina > 0 else 1
+        
+        if solo_conteo:
+            # Solo retornar información de paginación
+            return None, None, total_registros, total_paginas
+        
+        # Aplicar paginación para la web
+        inicio = (pagina - 1) * por_pagina
+        fin = inicio + por_pagina
+        df_paginado = df_final.iloc[inicio:fin]
+        
+        print(f"DEBUG: Reporte general con horas - Total: {total_registros}, Página {pagina}: {len(df_paginado)} empleados")
+        return df_paginado, "Reporte General de Asistencia y Horas", total_registros, total_paginas
+        
+    except Exception as e:
+        print(f"ERROR en reporte general: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, 0, 0
+
+def generar_reporte_ausentismo_especifico(conn, filters, pagina=1, por_pagina=30, solo_conteo=False):
+    """Reporte ausentismo con paginación"""
+    try:
+        codigos_ausentismo_real = ('F', 'PNP', 'LM', 'MUT')
+        df_completo = _construir_asistencia_completa(conn, filters)
+        
+        if df_completo.empty: 
+            print("DEBUG: DataFrame vacío en reporte ausentismo")
+            return None, None, 0, 0
+        
+        df_filtrado = df_completo[df_completo['codigo'].isin(codigos_ausentismo_real)]
+        if df_filtrado.empty: 
+            print("DEBUG: No hay datos de ausentismo")
+            return None, None, 0, 0
+
+        df_pivot = df_filtrado.pivot_table(
+            index=['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno'],
+            columns='codigo', values='rut', aggfunc='count', fill_value=0
+        )
+        df_pivot['Total Ausencias'] = df_pivot.sum(axis=1)
+        df_final = df_pivot.reset_index().sort_values('Total Ausencias', ascending=False)
+        
+        # Paginación
+        total_registros = len(df_final)
+        total_paginas = math.ceil(total_registros / por_pagina) if por_pagina > 0 else 1
+        
+        if solo_conteo:
+            return None, None, total_registros, total_paginas
+        
+        inicio = (pagina - 1) * por_pagina
+        fin = inicio + por_pagina
+        df_paginado = df_final.iloc[inicio:fin]
+        
+        print(f"DEBUG: Reporte ausentismo - Total: {total_registros}, Página {pagina}: {len(df_paginado)} empleados")
+        return df_paginado, "Reporte Específico de Ausentismo", total_registros, total_paginas
+        
+    except Exception as e:
+        print(f"ERROR en reporte ausentismo: {e}")
+        return None, None, 0, 0
+
+def construir_reporte_con_dias_para_excel(conn, filters):
+    """
+    Función especial que construye reporte CON días individuales para Excel.
+    Solo se usa en la exportación.
+    """
+    try:
+        df_completo = _construir_asistencia_completa(conn, filters)
+        if df_completo.empty:
+            return None
+        
+        print(f"DEBUG: Construyendo reporte con días para Excel...")
+        
+        # Convertir datos completos a matriz con días como columnas
+        fecha_desde = datetime.strptime(filters['date_from'], '%Y-%m-%d').date()
+        fecha_hasta = datetime.strptime(filters['date_to'], '%Y-%m-%d').date()
+        
+        # Crear lista de días en formato DD-MM
+        dias_rango = []
+        fecha_actual = fecha_desde
+        while fecha_actual <= fecha_hasta:
+            dias_rango.append(fecha_actual.strftime('%d-%m'))
+            fecha_actual += timedelta(days=1)
+        
+        # Construir matriz empleado x día
+        empleados_unicos = df_completo[['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno']].drop_duplicates()
+        
+        matriz_datos = []
+        
+        for _, empleado in empleados_unicos.iterrows():
+            fila_empleado = {
+                'rut': empleado['rut'],
+                'id_sap_local': empleado['id_sap_local'],
+                'nombre_completo': empleado['nombre_completo'],
+                'area': empleado['area'],
+                'cargo': empleado['cargo'],
+                'turno': empleado['turno']
+            }
+            
+            # Obtener datos de asistencia de este empleado
+            datos_empleado = df_completo[
+                (df_completo['rut'] == empleado['rut']) & 
+                (df_completo['id_sap_local'] == empleado['id_sap_local'])
+            ]
+            
+            # Crear diccionario fecha -> código para acceso rápido
+            asistencia_dict = {}
+            for _, reg in datos_empleado.iterrows():
+                fecha_obj = datetime.strptime(reg['fecha'], '%Y-%m-%d').date()
+                dia_str = fecha_obj.strftime('%d-%m')
+                asistencia_dict[dia_str] = reg['codigo']
+            
+            # Llenar cada día
+            for dia_str in dias_rango:
+                fila_empleado[dia_str] = asistencia_dict.get(dia_str, '')
+            
+            # Calcular métricas del empleado
+            codigos_empleado = [cod for cod in asistencia_dict.values() if cod != '']
+            contador = Counter(codigos_empleado)
+            
+            dias_trabajados = contador.get('T', 0)
+            fila_empleado['Días Trabajados'] = dias_trabajados
+            fila_empleado['Total Ausentismo'] = sum([contador.get(c, 0) for c in ['F', 'LM', 'PNP', 'MUT', 'PP']])
+            fila_empleado['Total Días Laborales'] = dias_trabajados + fila_empleado['Total Ausentismo']
+            
+            # Calcular horas
+            turno_str = str(empleado['turno']).strip().lower()
+            if any(t in turno_str for t in ['14x14', '15x13']):
+                horas_dia = 11
+            elif any(t in turno_str for t in ['6x1', '21x7']):
+                horas_dia = 44 / 6
+            elif any(t in turno_str for t in ['5x2', '9x5']):
+                horas_dia = 44 / 5
+            elif any(t in turno_str for t in ['12x12']):
+                horas_dia = 12
+            else:
+                horas_dia = 8
+                
+            fila_empleado['Total Horas'] = round(dias_trabajados * horas_dia, 2)
+            
+            # Porcentajes
+            if fila_empleado['Total Días Laborales'] > 0:
+                presentismo = (dias_trabajados / fila_empleado['Total Días Laborales']) * 100
+                ausentismo = (fila_empleado['Total Ausentismo'] / fila_empleado['Total Días Laborales']) * 100
+            else:
+                presentismo = ausentismo = 0
+                
+            fila_empleado['% Presentismo'] = f"{presentismo:.1f}%"
+            fila_empleado['% Ausentismo'] = f"{ausentismo:.1f}%"
+            
+            matriz_datos.append(fila_empleado)
+        
+        df_matriz = pd.DataFrame(matriz_datos)
+        
+        # Reorganizar columnas: info + días + métricas
+        info_cols = ['rut', 'id_sap_local', 'nombre_completo', 'area', 'cargo', 'turno']
+        dias_cols = dias_rango  # Mantiene orden cronológico: "31-07", "01-08", "02-08"
+        metricas_cols = ['Días Trabajados', 'Total Ausentismo', 'Total Días Laborales', 'Total Horas', '% Presentismo', '% Ausentismo']
+        
+        columnas_ordenadas = info_cols + dias_cols + metricas_cols
+        df_final = df_matriz[columnas_ordenadas]
+        
+        print(f"DEBUG: Matriz con días creada: {len(df_final)} empleados, {len(dias_cols)} días")
+        return df_final
+        
+    except Exception as e:
+        print(f"ERROR construyendo matriz con días: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# === RUTA PRINCIPAL ACTUALIZADA ===
+
+@app.route('/reportes', methods=['GET', 'POST'])
+@handle_db_error
+def reportes():
+    """Ruta con paginación mejorada"""
+    conn = get_db_connection()
+    
+    try:
+        catalogs = cargar_catalogos(conn)
+        report_data, report_html, report_title, filters = None, None, None, {}
+        display_dates = {}
+        
+        # Obtener página actual
+        pagina_actual = request.args.get('pagina', 1, type=int)
+        
+        if request.method == 'POST':
+            # Resetear a página 1 cuando se genera nuevo reporte
+            pagina_actual = 1
+            
+            # Procesar fechas (mantener tu lógica existente)
+            date_from_raw = request.form.get('date_from', '').strip()
+            date_to_raw = request.form.get('date_to', '').strip()
+            
+            date_from_iso = request.form.get('date_from_iso', '').strip()
+            date_to_iso = request.form.get('date_to_iso', '').strip()
+            
+            if date_from_iso and date_to_iso:
+                date_from_final = date_from_iso
+                date_to_final = date_to_iso
+            else:
+                date_from_final = convertir_fecha_chilena_a_iso(date_from_raw)
+                date_to_final = convertir_fecha_chilena_a_iso(date_to_raw)
+            
+            filters = {
+                'report_type': request.form.get('report_type'),
+                'date_from': date_from_final,
+                'date_to': date_to_final,
+                'area_id': request.form.get('area_id') or None,
+                'codigo_filtro': request.form.get('codigo_filtro') or None
+            }
+            
+            if not all([filters['report_type'], filters['date_from'], filters['date_to']]):
+                flash('Complete todos los campos requeridos.', 'warning')
+                filters['date_from_display'] = date_from_raw
+                filters['date_to_display'] = date_to_raw
+                return render_template('reportes.html', filters=filters, **catalogs)
+            
+            # Validar fechas
+            try:
+                fecha_desde = datetime.strptime(filters['date_from'], '%Y-%m-%d').date()
+                fecha_hasta = datetime.strptime(filters['date_to'], '%Y-%m-%d').date()
+                
+                display_dates = {
+                    'date_from_formatted': convertir_fecha_iso_a_chilena(filters['date_from']),
+                    'date_to_formatted': convertir_fecha_iso_a_chilena(filters['date_to'])
+                }
+                
+                if fecha_desde > fecha_hasta:
+                    flash('La fecha desde debe ser anterior a la fecha hasta.', 'error')
+                    filters['date_from_display'] = display_dates['date_from_formatted']
+                    filters['date_to_display'] = display_dates['date_to_formatted']
+                    return render_template('reportes.html', filters=filters, display_dates=display_dates, **catalogs)
+                    
+            except ValueError as e:
+                flash(f'Formato de fecha inválido: {str(e)}', 'error')
+                return render_template('reportes.html', filters=filters, **catalogs)
+            
+            # *** NUEVA LÓGICA CON PAGINACIÓN ***
+            try:
+                if filters['report_type'] == 'general_asistencia':
+                    df, report_title, total_registros, total_paginas = generar_reporte_general_con_horas(
+                        conn, filters, pagina_actual, por_pagina=30
+                    )
+                elif filters['report_type'] == 'ausentismo_especifico':
+                    df, report_title, total_registros, total_paginas = generar_reporte_ausentismo_especifico(
+                        conn, filters, pagina_actual, por_pagina=30
+                    )
+                else:
+                    flash('Tipo de reporte no válido.', 'error')
+                    return render_template('reportes.html', filters=filters, display_dates=display_dates, **catalogs)
+                    
+            except Exception as e:
+                print(f"ERROR generando reporte: {e}")
+                flash(f'Error: {str(e)}', 'error')
+                return render_template('reportes.html', filters=filters, display_dates=display_dates, **catalogs)
+
+            if df is not None and not df.empty:
+                report_data = True
+                report_html = df.to_html(classes='table table-striped table-responsive', index=False, na_rep='')
+
+                # Guardar en sesión para exportación completa
+                session['report_title'] = report_title
+                session['filters'] = filters
+                session['report_ready'] = True
+                
+                flash(f'Reporte generado: Mostrando {len(df)} de {total_registros} registros (Página {pagina_actual} de {total_paginas}).', 'success')
+                
+                # Información de paginación
+                paginacion = {
+                    'pagina_actual': pagina_actual,
+                    'total_paginas': total_paginas,
+                    'total_registros': total_registros,
+                    'registros_mostrados': len(df),
+                    'tiene_anterior': pagina_actual > 1,
+                    'tiene_siguiente': pagina_actual < total_paginas
+                }
+                
+                return render_template('reportes.html', 
+                                     report_html=report_html,
+                                     report_data=report_data, 
+                                     report_title=report_title,
+                                     filters=filters,
+                                     display_dates=display_dates,
+                                     paginacion=paginacion,
+                                     **catalogs)
+                
+            else:
+                flash('No se encontraron datos para los filtros seleccionados.', 'info')
+                session.pop('report_title', None)
+                session.pop('filters', None) 
+                session.pop('report_ready', None)
+
+        else:
+            # GET request - manejar navegación de páginas
+            if 'report_ready' in session and session.get('filters'):
+                filters = session['filters']
+                report_title = session['report_title']
+                
+                # Regenerar display_dates
+                display_dates = {
+                    'date_from_formatted': convertir_fecha_iso_a_chilena(filters['date_from']),
+                    'date_to_formatted': convertir_fecha_iso_a_chilena(filters['date_to'])
+                }
+                
+                # Generar página solicitada
+                try:
+                    if filters['report_type'] == 'general_asistencia':
+                        df, _, total_registros, total_paginas = generar_reporte_general_con_horas(
+                            conn, filters, pagina_actual, por_pagina=30
+                        )
+                    elif filters['report_type'] == 'ausentismo_especifico':
+                        df, _, total_registros, total_paginas = generar_reporte_ausentismo_especifico(
+                            conn, filters, pagina_actual, por_pagina=30
+                        )
+                    
+                    if df is not None and not df.empty:
+                        report_data = True
+                        report_html = df.to_html(classes='table table-striped table-responsive', index=False, na_rep='')
+                        
+                        paginacion = {
+                            'pagina_actual': pagina_actual,
+                            'total_paginas': total_paginas,
+                            'total_registros': total_registros,
+                            'registros_mostrados': len(df),
+                            'tiene_anterior': pagina_actual > 1,
+                            'tiene_siguiente': pagina_actual < total_paginas
+                        }
+                        
+                        return render_template('reportes.html', 
+                                             report_html=report_html,
+                                             report_data=report_data, 
+                                             report_title=report_title,
+                                             filters=filters,
+                                             display_dates=display_dates,
+                                             paginacion=paginacion,
+                                             **catalogs)
+                
+                except Exception as e:
+                    print(f"ERROR navegando páginas: {e}")
+            
+            # Limpiar sesión si no hay datos válidos
+            session.pop('report_title', None)
+            session.pop('filters', None)
+            session.pop('report_ready', None)
+            
+            # Establecer fechas por defecto
+            hoy = datetime.now().date()
+            primer_dia_mes = hoy.replace(day=1)
+            
+            display_dates = {
+                'date_from_formatted': convertir_fecha_iso_a_chilena(primer_dia_mes.strftime('%Y-%m-%d')),
+                'date_to_formatted': convertir_fecha_iso_a_chilena(hoy.strftime('%Y-%m-%d'))
+            }
+
+        return render_template('reportes.html', 
+                             report_html=report_html,
+                             report_data=report_data, 
+                             report_title=report_title,
+                             filters=filters,
+                             display_dates=display_dates,
+                             **catalogs)
+    finally:
+        conn.close()
+
+# === EXPORTACIÓN CON DÍAS INDIVIDUALES ===
+
+@app.route('/exportar_reporte')
+@handle_db_error
+def exportar_reporte():
+    """Exportar con días individuales en Excel y porcentajes en rojo"""
+    
+    if not session.get('report_ready'):
+        print("DEBUG: No hay reporte listo para exportar")
+        flash('No hay reporte generado para exportar.', 'error')
+        return redirect(url_for('reportes'))
+    
+    filters = session.get('filters')
+    report_title = session.get('report_title', 'Reporte')
+    
+    if not filters:
+        print("DEBUG: No hay filtros en sesión")
+        flash('Error: filtros perdidos.', 'error')
+        return redirect(url_for('reportes'))
+    
+    print(f"DEBUG: Exportando con días individuales. Filtros: {filters}")
+    
+    try:
+        conn = get_db_connection()
+        
+        # *** USAR FUNCIÓN ESPECIAL QUE INCLUYE DÍAS INDIVIDUALES ***
+        if filters['report_type'] == 'general_asistencia':
+            df = construir_reporte_con_dias_para_excel(conn, filters)
+        elif filters['report_type'] == 'ausentismo_especifico':
+            # Para ausentismo, regenerar normal (sin días por ahora)
+            df, _ = generar_reporte_ausentismo_especifico(conn, filters)
+        else:
+            df = None
+                
+        conn.close()
+        
+        if df is None or df.empty:
+            print("DEBUG: Error generando datos para exportar")
+            flash('Error generando datos para exportar.', 'error')
+            return redirect(url_for('reportes'))
+        
+        print(f"DEBUG: Datos para Excel listos: {len(df)} filas, {len(df.columns)} columnas")
+        
+        # Crear Excel con formato mejorado
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            sheet_name = re.sub(r'[\\/*?:\[\]]', '', report_title)[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=4)
+            
+            workbook = writer.book
+            worksheet = writer.sheets[sheet_name]
+
+            # Formatos
+            title_format = workbook.add_format({
+                'bold': True, 'font_size': 16, 'align': 'center',
+                'valign': 'vcenter', 'font_color': '#1f4e79'
+            })
+            
+            header_format = workbook.add_format({
+                'bold': True, 'bg_color': '#4472C4', 'font_color': 'white',
+                'border': 1, 'align': 'center', 'valign': 'vcenter'
+            })
+            
+            data_format = workbook.add_format({'border': 1})
+            
+            # *** NUEVOS FORMATOS PARA PORCENTAJES ***
+            porcentaje_alto_format = workbook.add_format({
+                'border': 1, 'bg_color': '#ffebee', 'font_color': '#d32f2f', 
+                'bold': True, 'align': 'center'
+            })
+            
+            porcentaje_medio_format = workbook.add_format({
+                'border': 1, 'bg_color': '#fff3e0', 'font_color': '#f57c00', 
+                'bold': True, 'align': 'center'
+            })
+            
+            porcentaje_bajo_format = workbook.add_format({
+                'border': 1, 'bg_color': '#e8f5e8', 'font_color': '#2e7d32', 
+                'bold': True, 'align': 'center'
+            })
+            
+            # Formatos para códigos de asistencia en días
+            codigo_formats = {
+                'T': workbook.add_format({'border': 1, 'bg_color': '#d1fae5', 'align': 'center', 'bold': True}),
+                'D': workbook.add_format({'border': 1, 'bg_color': '#e5e7eb', 'align': 'center', 'bold': True}),
+                'F': workbook.add_format({'border': 1, 'bg_color': '#fee2e2', 'align': 'center', 'bold': True}),
+                'LM': workbook.add_format({'border': 1, 'bg_color': '#fef3c7', 'align': 'center', 'bold': True}),
+                'V': workbook.add_format({'border': 1, 'bg_color': '#dbeafe', 'align': 'center', 'bold': True}),
+                'otros': workbook.add_format({'border': 1, 'bg_color': '#f3f4f6', 'align': 'center'})
+            }
+
+            # Encabezados y metadatos
+            worksheet.merge_range(0, 0, 0, len(df.columns)-1, report_title, title_format)
+            
+            # Formato de fechas chileno
+            try:
+                fecha_desde_obj = datetime.strptime(filters['date_from'], '%Y-%m-%d')
+                fecha_hasta_obj = datetime.strptime(filters['date_to'], '%Y-%m-%d')
+                fecha_desde_chile = fecha_desde_obj.strftime('%d-%m-%Y')
+                fecha_hasta_chile = fecha_hasta_obj.strftime('%d-%m-%Y')
+            except:
+                fecha_desde_chile = filters['date_from']
+                fecha_hasta_chile = filters['date_to']
+            
+            info_format = workbook.add_format({'font_size': 10, 'italic': True})
+            periodo_text = f"Período: {fecha_desde_chile} al {fecha_hasta_chile}"
+            worksheet.merge_range(1, 0, 1, len(df.columns)-1, periodo_text, info_format)
+            
+            fecha_generacion = datetime.now().strftime('%d-%m-%Y %H:%M')
+            gen_text = f"Generado: {fecha_generacion}"
+            worksheet.merge_range(2, 0, 2, len(df.columns)-1, gen_text, info_format)
+
+            # Headers
+            for col_num, value in enumerate(df.columns.values):
+                worksheet.write(4, col_num, value, header_format)
+
+            # *** IDENTIFICAR COLUMNAS DE PORCENTAJES ***
+            columnas_porcentajes = {}
+            for col_num, column_name in enumerate(df.columns.values):
+                if '% Ausentismo' in column_name:
+                    columnas_porcentajes[col_num] = 'ausentismo'
+                elif '% Presentismo' in column_name:
+                    columnas_porcentajes[col_num] = 'presentismo'
+                elif column_name.endswith('%') or 'porcentaje' in column_name.lower():
+                    columnas_porcentajes[col_num] = 'general'
+
+            # *** FUNCIÓN PARA DETERMINAR FORMATO DE PORCENTAJE ***
+            def get_porcentaje_format(valor_str, tipo_porcentaje):
+                try:
+                    # Extraer valor numérico del porcentaje
+                    valor = float(valor_str.replace('%', '').strip())
+                    
+                    if tipo_porcentaje == 'ausentismo':
+                        # Ausentismo: valores altos son malos (rojo)
+                        if valor >= 15:
+                            return porcentaje_alto_format
+                        elif valor >= 8:
+                            return porcentaje_medio_format
+                        else:
+                            return porcentaje_bajo_format
+                            
+                    elif tipo_porcentaje == 'presentismo':
+                        # Presentismo: valores bajos son malos (rojo)
+                        if valor <= 85:
+                            return porcentaje_alto_format
+                        elif valor <= 92:
+                            return porcentaje_medio_format
+                        else:
+                            return porcentaje_bajo_format
+                            
+                    else:
+                        # Porcentajes generales: asumir que valores bajos son malos
+                        if valor <= 70:
+                            return porcentaje_alto_format
+                        elif valor <= 85:
+                            return porcentaje_medio_format
+                        else:
+                            return porcentaje_bajo_format
+                            
+                except (ValueError, AttributeError):
+                    return data_format
+
+            # Datos con formato especial para días y porcentajes
+            for row_num in range(len(df)):
+                for col_num, (column_name, value) in enumerate(df.iloc[row_num].items()):
+                    
+                    # *** FORMATO ESPECIAL PARA PORCENTAJES ***
+                    if col_num in columnas_porcentajes and str(value).endswith('%'):
+                        tipo_porcentaje = columnas_porcentajes[col_num]
+                        cell_format = get_porcentaje_format(str(value), tipo_porcentaje)
+                        worksheet.write(row_num + 5, col_num, value, cell_format)
+                        
+                    # Detectar columnas de días (formato DD-MM)
+                    elif len(column_name) == 5 and '-' in column_name and column_name[2] == '-':
+                        # Es una columna de día
+                        if str(value) in codigo_formats:
+                            cell_format = codigo_formats[str(value)]
+                        else:
+                            cell_format = codigo_formats.get('otros')
+                        worksheet.write(row_num + 5, col_num, value, cell_format)
+                        
+                    else:
+                        # Columna normal
+                        worksheet.write(row_num + 5, col_num, value, data_format)
+
+            # Ajustar anchos de columnas
+            for idx, col in enumerate(df.columns):
+                if col in ['rut', 'id_sap_local']:
+                    width = 12
+                elif col == 'nombre_completo':
+                    width = 35
+                elif col in ['area', 'cargo', 'turno']:
+                    width = 18
+                elif len(col) == 5 and '-' in col:  # Días DD-MM
+                    width = 6
+                elif 'Total' in col or 'Días' in col:
+                    width = 12
+                elif '%' in col:  # Columnas de porcentajes
+                    width = 14
+                else:
+                    width = 15
+                
+                worksheet.set_column(idx, idx, width)
+
+            # *** AGREGAR FORMATO CONDICIONAL ADICIONAL ***
+            # Esto aplica formato condicional a nivel de Excel para porcentajes
+            for col_num, tipo in columnas_porcentajes.items():
+                start_row = 5  # Primera fila de datos
+                end_row = len(df) + 4  # Última fila de datos
+                col_letter = chr(ord('A') + col_num)
+                range_str = f'{col_letter}{start_row}:{col_letter}{end_row}'
+                
+                if tipo == 'ausentismo':
+                    # Formato condicional para ausentismo alto
+                    worksheet.conditional_format(range_str, {
+                        'type': 'cell',
+                        'criteria': '>=',
+                        'value': 15,
+                        'format': porcentaje_alto_format
+                    })
+                    worksheet.conditional_format(range_str, {
+                        'type': 'cell',
+                        'criteria': 'between',
+                        'minimum': 8,
+                        'maximum': 14.99,
+                        'format': porcentaje_medio_format
+                    })
+                    
+                elif tipo == 'presentismo':
+                    # Formato condicional para presentismo bajo
+                    worksheet.conditional_format(range_str, {
+                        'type': 'cell',
+                        'criteria': '<=',
+                        'value': 85,
+                        'format': porcentaje_alto_format
+                    })
+                    worksheet.conditional_format(range_str, {
+                        'type': 'cell',
+                        'criteria': 'between',
+                        'minimum': 85.01,
+                        'maximum': 92,
+                        'format': porcentaje_medio_format
+                    })
+
+        output.seek(0)
+        
+        # Limpiar sesión
+        session.pop('report_title', None)
+        session.pop('filters', None)
+        session.pop('report_ready', None)
+        
+        timestamp = datetime.now().strftime("%d%m%Y_%H%M")
+        download_name = f'{sheet_name.replace(" ", "_")}_{timestamp}.xlsx'
+        
+        print(f"DEBUG: Archivo Excel creado con porcentajes en rojo: {download_name}")
+        
+        return send_file(
+            output, 
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, 
+            download_name=download_name
+        )
+        
+    except Exception as e:
+        print(f"ERROR exportando: {e}")
+        import traceback
+        traceback.print_exc()
+        flash(f'Error exportando: {str(e)}', 'error')
+        return redirect(url_for('reportes'))
+
+# *** FUNCIÓN AUXILIAR PARA IDENTIFICAR PORCENTAJES ***
+def es_porcentaje_malo(valor_str, tipo_columna):
+    """Determina si un porcentaje debe mostrarse en rojo"""
+    try:
+        valor = float(valor_str.replace('%', '').strip())
+        
+        if 'ausentismo' in tipo_columna.lower():
+            return valor >= 15  # Ausentismo alto es malo
+        elif 'presentismo' in tipo_columna.lower():
+            return valor <= 85  # Presentismo bajo es malo
+        else:
+            return valor <= 70  # Para otros porcentajes, asumir que bajo es malo
+            
+    except (ValueError, AttributeError):
+        return False
+
+    
+# === SISTEMA DE GESTIÓN DE TURNOS ===
+
+@app.route('/gestion_turnos')
+def gestion_turnos():
+    conn = get_db_connection()
+    
+    # Obtener la lista de turnos con la cantidad de empleados asignados
+    turnos_raw = conn.execute('''
+        SELECT t.id, t.nombre, t.patron, COUNT(e.id) as empleados_asignados
+        FROM turnos t
+        LEFT JOIN empleados e ON e.turno_id = t.id
+        GROUP BY t.id
+        ORDER BY t.nombre
+    ''').fetchall()
+    turnos = [dict(row) for row in turnos_raw]
+    
+    # CRÍTICO: Obtener TODOS los registros del calendario, no solo el mes actual
+    registros_calendario = conn.execute('''
+        SELECT turno_id, fecha, codigo 
+        FROM calendario_turnos 
+        ORDER BY fecha
+    ''').fetchall()
+    
+    print(f"🔍 Cargando {len(registros_calendario)} registros de calendario desde la BD")
+    
+    # Organizar el calendario en un formato fácil de usar para JavaScript
+    calendario_turnos = {}
+    for registro in registros_calendario:
+        turno_id = registro['turno_id']
+        if turno_id not in calendario_turnos:
+            calendario_turnos[turno_id] = {}
+        
+        fecha_obj = datetime.strptime(registro['fecha'], '%Y-%m-%d').date()
+        # Creamos una clave "YYYY-M" para el mes (JS cuenta meses de 0-11)
+        clave_mes = f"{fecha_obj.year}-{fecha_obj.month - 1}"
+        if clave_mes not in calendario_turnos[turno_id]:
+            calendario_turnos[turno_id][clave_mes] = {}
+
+        calendario_turnos[turno_id][clave_mes][fecha_obj.day] = registro['codigo']
+    
+    # Log para debug
+    for turno_id, meses in calendario_turnos.items():
+        print(f"📅 Turno {turno_id}: {len(meses)} meses configurados - {list(meses.keys())}")
+        
+    conn.close()
+    
+    # Obtener año y mes actual para el frontend
+    ano_actual = request.args.get('ano', datetime.now().year, type=int)
+    mes_actual = request.args.get('mes', datetime.now().month, type=int)
+    
+    # Enviar todos los datos a la plantilla
+    return render_template('gestion_turnos.html',
+                           turnos=turnos,
+                           calendario_turnos=calendario_turnos,
+                           ano_actual=ano_actual,
+                           mes_actual=mes_actual)
+
+
+@app.route('/crear_turno', methods=['POST'])
+def crear_turno():
+    nombre = request.form.get('nombre')
+    descripcion = request.form.get('descripcion')
+    patron = request.form.get('patron')  # Ej: "6x1", "14x14", etc.
+    
+    if not nombre:
+        flash('El nombre del turno es requerido.', 'error')
+        return redirect(url_for('gestion_turnos'))
+    
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO turnos (nombre, descripcion, patron) VALUES (?, ?, ?)',
+                    (nombre, descripcion, patron))
+        conn.commit()
+        flash(f'Turno "{nombre}" creado exitosamente.', 'success')
+    except sqlite3.IntegrityError:
+        flash(f'Ya existe un turno con el nombre "{nombre}".', 'error')
+    finally:
+        conn.close()
+    
+    return redirect(url_for('gestion_turnos'))
+
+@app.route('/guardar_calendario_turno', methods=['POST'])
+def guardar_calendario_turno():
+    data = request.get_json()
+    turno_id = data.get('turno_id')
+    ano = data.get('ano')
+    mes = data.get('mes')
+    calendario = data.get('calendario')  # {dia: codigo}
+    
+    if not all([turno_id, ano, mes]):
+        return jsonify({'status': 'error', 'message': 'Datos incompletos'}), 400
+    
+    conn = get_db_connection()
+    try:
+        conn.execute('BEGIN TRANSACTION;')
+        
+        # Eliminar calendario existente para ese turno y mes
+        conn.execute('''
+            DELETE FROM calendario_turnos 
+            WHERE turno_id = ? AND strftime('%Y-%m', fecha) = ?
+        ''', (turno_id, f'{ano:04d}-{mes:02d}'))
+        
+        # Insertar nuevos valores
+        registros = []
+        if calendario: # Asegurarse de que el calendario no esté vacío
+            for dia, codigo in calendario.items():
+                fecha = f'{ano:04d}-{mes:02d}-{int(dia):02d}'
+                registros.append((turno_id, fecha, codigo))
+        
+        if registros:
+            conn.executemany('INSERT INTO calendario_turnos (turno_id, fecha, codigo) VALUES (?, ?, ?)', registros)
+
+        conn.commit()
+        return jsonify({'status': 'success', 'message': 'Calendario guardado exitosamente'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'status': 'error', 'message': f'Error de base de datos: {e}'}), 500
+    finally:
+        conn.close()
+
+@app.route('/aplicar_plantilla_turno', methods=['POST'])
+def aplicar_plantilla_turno():
+    import traceback
+    import calendar
+
+    conn = None
+    try:
+        # Verificar que lleguen datos JSON
+        if not request.is_json:
+            return jsonify({'status': 'error', 'message': 'Se esperaba contenido JSON'}), 400
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({'status': 'error', 'message': 'No se recibieron datos JSON'}), 400
+            
+        turno_id = data.get('turno_id')
+        patron = data.get('patron')
+        ano = data.get('ano')
+        mes = data.get('mes')
+        inicio_ciclo = data.get('inicio_ciclo', 1)
+        
+        # Validación de datos básicos
+        if not all([turno_id, patron, ano, mes]):
+            return jsonify({'status': 'error', 'message': 'Datos incompletos: se requiere turno_id, patron, ano y mes'}), 400
+        
+        # Convertir a enteros de manera segura
+        try:
+            ano = int(ano)
+            mes = int(mes)
+            inicio_ciclo = int(inicio_ciclo)
+            turno_id = int(turno_id)
+        except (ValueError, TypeError) as e:
+            return jsonify({'status': 'error', 'message': f'Error en los datos numéricos: {str(e)}'}), 400
+        
+        # Parsear el patrón (ej: "6x1" = 6 días trabajo, 1 descanso)
+        if 'x' not in patron:
+            return jsonify({'status': 'error', 'message': f'Formato de patrón inválido: "{patron}". Debe ser como "6x1".'}), 400
+        
+        try:
+            partes = patron.split('x')
+            if len(partes) != 2:
+                raise ValueError("Formato incorrecto")
+            
+            dias_trabajo = int(partes[0])
+            dias_descanso = int(partes[1])
+            
+            if dias_trabajo < 0 or dias_descanso < 0:
+                raise ValueError("Los días no pueden ser negativos")
+                
+        except ValueError as e:
+            return jsonify({'status': 'error', 'message': f'Formato de patrón inválido: "{patron}". Ambas partes deben ser números enteros válidos.'}), 400
+
+        # Evitar división por cero
+        ciclo_total = dias_trabajo + dias_descanso
+        if ciclo_total == 0:
+            return jsonify({'status': 'error', 'message': 'El patrón no puede ser "0x0".'}), 400
+
+        # Generar calendario según el patrón
+        calendario = {}
+        dias_en_mes = calendar.monthrange(ano, mes)[1]
+
+        for dia in range(1, dias_en_mes + 1):
+            # Calcular posición en el ciclo (0-indexed)
+            dias_desde_inicio = (dia - inicio_ciclo) % ciclo_total
+            
+            if dias_desde_inicio < dias_trabajo:
+                calendario[str(dia)] = 'T'
+            else:
+                calendario[str(dia)] = 'D'
+        
+        # Guardar el calendario generado
+        conn = get_db_connection()
+        conn.execute('BEGIN TRANSACTION')
+        
+        try:
+            # Eliminar calendario existente para ese turno y mes
+            conn.execute('''
+                DELETE FROM calendario_turnos 
+                WHERE turno_id = ? AND strftime('%Y-%m', fecha) = ?
+            ''', (turno_id, f'{ano:04d}-{mes:02d}'))
+            
+            # Insertar nuevo calendario
+            registros = []
+            for dia, codigo in calendario.items():
+                fecha = f'{ano:04d}-{mes:02d}-{int(dia):02d}'
+                registros.append((turno_id, fecha, codigo))
+            
+            if registros:
+                conn.executemany(
+                    'INSERT INTO calendario_turnos (turno_id, fecha, codigo) VALUES (?, ?, ?)', 
+                    registros
+                )
+            
+            # Reemplaza solo la parte final de tu función aplicar_plantilla_turno
+# desde "conn.commit()" hasta el final
+
+            conn.commit()
+            print("✅ Datos guardados exitosamente en la base de datos")
+            
+            # Crear la respuesta que vamos a enviar
+            response_data = {
+                'status': 'success', 
+                'message': f'Plantilla {patron} aplicada exitosamente',
+                'calendario': calendario
+            }
+            
+            print(f"📤 Enviando respuesta: {response_data}")
+            
+            # Verificar que el calendario tiene datos
+            if not calendario:
+                print("⚠️  ADVERTENCIA: El calendario está vacío")
+            else:
+                print(f"📅 Calendario generado con {len(calendario)} días")
+            
+            try:
+                json_response = jsonify(response_data)
+                print("✅ JSON response creado exitosamente")
+                return json_response
+            except Exception as json_error:
+                print(f"❌ Error creando JSON response: {json_error}")
+                return jsonify({'status': 'error', 'message': f'Error en respuesta JSON: {str(json_error)}'}), 500
+            
+        except Exception as db_error:
+            print(f"❌ Error de base de datos: {db_error}")
+            conn.rollback()
+            raise db_error
+
+    except Exception as e:
+        # Si hay una conexión abierta, hacer rollback
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        
+        # Log del error completo en la terminal del servidor
+        print("="*50)
+        print("❌ ERROR EN /aplicar_plantilla_turno")
+        print("="*50)
+        import traceback
+        traceback.print_exc()
+        print("="*50)
+        
+        # Retornar error específico como JSON válido
+        error_msg = str(e) if str(e) else "Error interno del servidor"
+        try:
+            error_response = jsonify({'status': 'error', 'message': f'Error al aplicar plantilla: {error_msg}'})
+            print(f"📤 Enviando respuesta de error: {error_msg}")
+            return error_response, 500
+        except Exception as json_error:
+            print(f"❌ Error crítico creando respuesta de error: {json_error}")
+            # Fallback a respuesta de texto plano
+            from flask import Response
+            return Response(f'{{"status": "error", "message": "Error crítico: {error_msg}"}}', 
+                          status=500, mimetype='application/json')
+
+    finally:
+        # Cerrar conexión si existe
+        if conn:
+            try:
+                conn.close()
+                print("🔌 Conexión cerrada")
+            except:
+                pass
+
+# Reemplaza la función aplicar_plantilla_rango en tu app.py con esta versión corregida:
+
+@app.route('/aplicar_plantilla_rango', methods=['POST'])
+def aplicar_plantilla_rango():
+    import traceback
+    import calendar
+
+    conn = None
+    try:
+        # Verificar que lleguen datos JSON
+        if not request.is_json:
+            return jsonify({'status': 'error', 'message': 'Se esperaba contenido JSON'}), 400
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({'status': 'error', 'message': 'No se recibieron datos JSON'}), 400
+            
+        turno_id = data.get('turno_id')
+        patron = data.get('patron')
+        fecha_inicio = data.get('fecha_inicio')
+        fecha_fin = data.get('fecha_fin')
+        inicio_ciclo = data.get('inicio_ciclo', 1)
+        
+        # Validación de datos básicos
+        if not all([turno_id, patron, fecha_inicio, fecha_fin]):
+            return jsonify({'status': 'error', 'message': 'Datos incompletos: se requiere turno_id, patron, fecha_inicio y fecha_fin'}), 400
+        
+        # Convertir a enteros de manera segura
+        try:
+            inicio_ciclo = int(inicio_ciclo)
+            turno_id = int(turno_id)
+        except (ValueError, TypeError) as e:
+            return jsonify({'status': 'error', 'message': f'Error en los datos numéricos: {str(e)}'}), 400
+        
+        # Convertir fechas a objetos datetime
+        try:
+            from datetime import datetime
+            inicio = datetime.strptime(fecha_inicio, '%Y-%m')
+            fin = datetime.strptime(fecha_fin, '%Y-%m')
+            
+            if inicio > fin:
+                return jsonify({'status': 'error', 'message': 'La fecha de inicio debe ser anterior a la fecha fin'}), 400
+                
+        except ValueError:
+            return jsonify({'status': 'error', 'message': 'Formato de fecha inválido. Use YYYY-MM.'}), 400
+        
+        # Parsear el patrón (ej: "6x1" = 6 días trabajo, 1 descanso)
+        if 'x' not in patron:
+            return jsonify({'status': 'error', 'message': f'Formato de patrón inválido: "{patron}". Debe ser como "6x1".'}), 400
+        
+        try:
+            partes = patron.split('x')
+            if len(partes) != 2:
+                raise ValueError("Formato incorrecto")
+            
+            dias_trabajo = int(partes[0])
+            dias_descanso = int(partes[1])
+            
+            if dias_trabajo < 0 or dias_descanso < 0:
+                raise ValueError("Los días no pueden ser negativos")
+                
+        except ValueError as e:
+            return jsonify({'status': 'error', 'message': f'Formato de patrón inválido: "{patron}". Ambas partes deben ser números enteros válidos.'}), 400
+
+        # Evitar división por cero
+        ciclo_total = dias_trabajo + dias_descanso
+        if ciclo_total == 0:
+            return jsonify({'status': 'error', 'message': 'El patrón no puede ser "0x0".'}), 400
+
+        # Procesar cada mes en el rango
+        conn = get_db_connection()
+        
+        # CRÍTICO: Iniciar transacción explícita
+        conn.execute('BEGIN IMMEDIATE TRANSACTION')
+        
+        current = inicio
+        calendario_completo = {}  # Para almacenar todos los cambios
+        total_registros_insertados = 0
+        
+        print(f"🔄 Iniciando aplicación de plantilla de {fecha_inicio} a {fecha_fin}")
+        
+        while current <= fin:
+            ano = current.year
+            mes = current.month
+            dias_en_mes = calendar.monthrange(ano, mes)[1]
+
+            print(f"📅 Procesando {mes:02d}/{ano} - {dias_en_mes} días")
+
+            # Eliminar calendario existente para ese turno y mes
+            deleted_count = conn.execute('''
+                DELETE FROM calendario_turnos 
+                WHERE turno_id = ? AND strftime('%Y-%m', fecha) = ?
+            ''', (turno_id, f'{ano:04d}-{mes:02d}')).rowcount
+            
+            print(f"🗑️ Eliminados {deleted_count} registros existentes para {mes:02d}/{ano}")
+            
+            # Generar calendario según el patrón
+            calendario = {}
+            registros_mes = []
+            
+            for dia in range(1, dias_en_mes + 1):
+                # Calcular posición en el ciclo (0-indexed)
+                dias_desde_inicio = (dia - inicio_ciclo) % ciclo_total
+                
+                if dias_desde_inicio < 0:
+                    dias_desde_inicio += ciclo_total
+                
+                if dias_desde_inicio < dias_trabajo:
+                    codigo = 'T'
+                else:
+                    codigo = 'D'
+                
+                calendario[str(dia)] = codigo
+                
+                # Preparar registro para inserción
+                fecha = f'{ano:04d}-{mes:02d}-{dia:02d}'
+                registros_mes.append((turno_id, fecha, codigo))
+            
+            # Almacenar en calendario_completo para retornar
+            mes_key = f"{ano}-{mes-1}"  # Formato compatible con JS (mes 0-11)
+            calendario_completo[mes_key] = calendario
+            
+            # Insertar nuevos registros
+            if registros_mes:
+                conn.executemany(
+                    'INSERT INTO calendario_turnos (turno_id, fecha, codigo) VALUES (?, ?, ?)', 
+                    registros_mes
+                )
+                total_registros_insertados += len(registros_mes)
+                print(f"✅ Insertados {len(registros_mes)} registros para {mes:02d}/{ano}")
+            
+            # Avanzar al próximo mes
+            if current.month == 12:
+                current = current.replace(year=current.year+1, month=1)
+            else:
+                current = current.replace(month=current.month+1)
+        
+        # CRÍTICO: Commit explícito
+        conn.commit()
+        print(f"💾 Commit exitoso: {total_registros_insertados} registros guardados en total")
+        
+        return jsonify({
+            'status': 'success', 
+            'message': f'Plantilla {patron} aplicada exitosamente desde {fecha_inicio} hasta {fecha_fin}. {total_registros_insertados} registros guardados.',
+            'calendario': calendario_completo,
+            'registros_guardados': total_registros_insertados
+        })
+        
+    except Exception as e:
+        # Si hay una conexión abierta, hacer rollback
+        if conn:
+            try:
+                conn.rollback()
+                print(f"🔄 Rollback ejecutado debido a error: {e}")
+            except:
+                pass
+        
+        # Log del error completo en la terminal del servidor
+        print("="*50)
+        print("❌ ERROR EN /aplicar_plantilla_rango")
+        print("="*50)
+        traceback.print_exc()
+        print("="*50)
+        
+        # Retornar error específico como JSON válido
+        error_msg = str(e) if str(e) else "Error interno del servidor"
+        return jsonify({'status': 'error', 'message': f'Error al aplicar plantilla: {error_msg}'}), 500
+
+    finally:
+        # Cerrar conexión si existe
+        if conn:
+            try:
+                conn.close()
+                print("🔌 Conexión cerrada")
+            except:
+                pass
+
+@app.route('/obtener_meses_con_calendario/<int:turno_id>')
+def obtener_meses_con_calendario(turno_id):
+    """Obtener todos los meses que tienen calendario configurado para un turno"""
+    conn = get_db_connection()
+    
+    meses = conn.execute('''
+        SELECT DISTINCT strftime('%Y-%m', fecha) as mes
+        FROM calendario_turnos
+        WHERE turno_id = ?
+        ORDER BY fecha DESC
+    ''', (turno_id,)).fetchall()
+    
+    conn.close()
+    
+    return jsonify([dict(m)['mes'] for m in meses])
+
+@app.route('/copiar_calendario_mes', methods=['POST'])
+def copiar_calendario_mes():
+    data = request.get_json()
+    turno_id = data.get('turno_id')
+    ano_origen = data.get('ano_origen')
+    mes_origen = data.get('mes_origen')
+    ano_destino = data.get('ano_destino')
+    mes_destino = data.get('mes_destino')
+    
+    conn = get_db_connection()
+    
+    # Obtener calendario origen
+    calendario_origen = conn.execute('''
+        SELECT fecha, codigo FROM calendario_turnos
+        WHERE turno_id = ? AND strftime('%Y-%m', fecha) = ?
+    ''', (turno_id, f'{ano_origen:04d}-{mes_origen:02d}')).fetchall()
+    
+    if not calendario_origen:
+        conn.close()
+        return jsonify({
+            'status': 'error', 
+            'message': f'No hay calendario configurado para {mes_origen}/{ano_origen}. '
+                      f'Primero debe configurar el mes de origen o usar "Aplicar Plantilla" para generar un patrón automático.'
+        }), 400
+    
+    # Eliminar calendario destino si existe
+    conn.execute('''
+        DELETE FROM calendario_turnos 
+        WHERE turno_id = ? AND strftime('%Y-%m', fecha) = ?
+    ''', (turno_id, f'{ano_destino:04d}-{mes_destino:02d}'))
+    
+    # Copiar ajustando las fechas
+    for registro in calendario_origen:
+        dia = int(registro['fecha'].split('-')[2])
+        # Verificar que el día existe en el mes destino
+        if dia <= calendar.monthrange(ano_destino, mes_destino)[1]:
+            fecha_nueva = f'{ano_destino:04d}-{mes_destino:02d}-{dia:02d}'
+            conn.execute('''
+                INSERT INTO calendario_turnos (turno_id, fecha, codigo)
+                VALUES (?, ?, ?)
+            ''', (turno_id, fecha_nueva, registro['codigo']))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'status': 'success', 'message': 'Calendario copiado exitosamente'}) 
+
+#Exporta Calendario Turno PDF
+@app.route('/exportar_calendario_excel')
+def exportar_calendario_excel():
+    # Parámetros de fecha - pueden ser un mes específico o un rango
+    fecha_desde = request.args.get('fecha_desde')  # Formato: YYYY-MM
+    fecha_hasta = request.args.get('fecha_hasta')  # Formato: YYYY-MM
+    
+    # Si no se especifica rango, usar mes y año actuales
+    if not fecha_desde or not fecha_hasta:
+        ano = request.args.get('ano', datetime.now().year, type=int)
+        mes = request.args.get('mes', datetime.now().month, type=int)
+        fecha_desde = f"{ano:04d}-{mes:02d}"
+        fecha_hasta = f"{ano:04d}-{mes:02d}"
+    
+    conn = get_db_connection()
+    
+    # Obtener todos los turnos
+    turnos = conn.execute('SELECT id, nombre, patron FROM turnos ORDER BY nombre').fetchall()
+    
+    # Obtener registros del calendario para el rango de fechas
+    calendario_rango = conn.execute('''
+        SELECT ct.turno_id, ct.fecha, ct.codigo, t.nombre as turno_nombre
+        FROM calendario_turnos ct
+        JOIN turnos t ON ct.turno_id = t.id
+        WHERE ct.fecha >= ? AND ct.fecha <= ?
+        ORDER BY ct.fecha, t.nombre
+    ''', (fecha_desde + '-01', fecha_hasta + '-31')).fetchall()
+    
+    conn.close()
+    
+    # NOMBRES EN ESPAÑOL
+    nombres_meses = [
+        'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+        'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+    ]
+    
+    dias_semana = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+    
+    # Generar todas las fechas del rango
+    fechas_completas = []
+    calendario_dict = {}
+    
+    # Parsear fechas de inicio y fin
+    fecha_inicio = datetime.strptime(fecha_desde + '-01', '%Y-%m-%d').date()
+    fecha_fin_obj = datetime.strptime(fecha_hasta + '-01', '%Y-%m-%d').date()
+    # Obtener el último día del mes final
+    ultimo_dia_mes_final = calendar.monthrange(fecha_fin_obj.year, fecha_fin_obj.month)[1]
+    fecha_fin = fecha_fin_obj.replace(day=ultimo_dia_mes_final)
+    
+    # Generar todas las fechas del rango
+    fecha_actual = fecha_inicio
+    while fecha_actual <= fecha_fin:
+        dia_semana = dias_semana[fecha_actual.weekday()]
+        mes_nombre = nombres_meses[fecha_actual.month - 1]
+        fecha_formateada = f"{dia_semana}, {fecha_actual.day:02d} de {mes_nombre} de {fecha_actual.year}"
+        fechas_completas.append(fecha_formateada)
+        fecha_actual += timedelta(days=1)
+    
+    # Organizar calendario por turno y fecha
+    for reg in calendario_rango:
+        fecha_obj = datetime.strptime(reg['fecha'], '%Y-%m-%d').date()
+        turno_nombre = reg['turno_nombre']
+        
+        if turno_nombre not in calendario_dict:
+            calendario_dict[turno_nombre] = {}
+        calendario_dict[turno_nombre][fecha_obj] = reg['codigo']
+    
+    # Crear DataFrame
+    data = {'fecha': fechas_completas}
+    
+    # Agregar columnas por turno
+    for turno in turnos:
+        turno_nombre = turno['nombre']
+        columna_datos = []
+        
+        fecha_actual = fecha_inicio
+        while fecha_actual <= fecha_fin:
+            codigo = calendario_dict.get(turno_nombre, {}).get(fecha_actual, '')
+            columna_datos.append(codigo)
+            fecha_actual += timedelta(days=1)
+        
+        data[turno_nombre] = columna_datos
+    
+    df = pd.DataFrame(data)
+    
+    # Crear archivo Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        
+        # Escribir datos
+        df.to_excel(writer, index=False, sheet_name='Calendario')
+        worksheet = writer.sheets['Calendario']
+        
+        # Formatos
+        header_format = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'top',
+            'fg_color': '#D7E4BD',
+            'border': 1
+        })
+        
+        fecha_format = workbook.add_format({
+            'fg_color': '#F2F2F2',
+            'border': 1,
+            'text_wrap': True,
+            'valign': 'top'
+        })
+        
+        trabajo_format = workbook.add_format({
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1
+        })
+        
+        descanso_format = workbook.add_format({
+            'align': 'center',
+            'valign': 'vcenter',
+            'fg_color': '#92D050',
+            'border': 1
+        })
+        
+        # Aplicar formato a encabezados
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+        
+        # Aplicar formato a datos
+        for row_num in range(1, len(df) + 1):
+            # Columna de fecha
+            worksheet.write(row_num, 0, df.iloc[row_num-1, 0], fecha_format)
+            
+            # Columnas de turnos
+            for col_num in range(1, len(df.columns)):
+                value = df.iloc[row_num-1, col_num]
+                if value == 'D':
+                    worksheet.write(row_num, col_num, value, descanso_format)
+                elif value == 'TD':
+                    worksheet.write(row_num, col_num, value, trabajo_format)
+                else:
+                    worksheet.write(row_num, col_num, value, trabajo_format)
+        
+        # Ajustar ancho de columnas
+        worksheet.set_column('A:A', 35)  # Columna de fecha
+        for i in range(1, len(df.columns)):
+            worksheet.set_column(i, i, 15)  # Columnas de turnos
+        
+        # Ajustar altura de filas
+        worksheet.set_row(0, 30)  # Encabezado
+        for i in range(1, len(df) + 1):
+            worksheet.set_row(i, 20)
+    
+    output.seek(0)
+    
+    # NOMBRE DE ARCHIVO según el rango
+    if fecha_desde == fecha_hasta:
+        mes_num = int(fecha_desde.split('-')[1])
+        ano_num = int(fecha_desde.split('-')[0])
+        filename = f'calendario_turnos_{nombres_meses[mes_num-1]}_{ano_num}.xlsx'
+    else:
+        fecha_inicio_str = fecha_desde.replace('-', '_')
+        fecha_fin_str = fecha_hasta.replace('-', '_')
+        filename = f'calendario_turnos_{fecha_inicio_str}_al_{fecha_fin_str}.xlsx'
+    
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
+@app.route('/exportar_calendario_pdf')
+def exportar_calendario_pdf():
+    """Versión que garantiza UN MES = UNA PÁGINA"""
+    try:
+        from weasyprint import HTML, CSS
+        from io import BytesIO
+        
+        # Parámetros de fecha
+        fecha_desde = request.args.get('fecha_desde')  # Formato: YYYY-MM
+        fecha_hasta = request.args.get('fecha_hasta')  # Formato: YYYY-MM
+        
+        if not fecha_desde or not fecha_hasta:
+            ano = request.args.get('ano', datetime.now().year, type=int)
+            mes = request.args.get('mes', datetime.now().month, type=int)
+            fecha_desde = f"{ano:04d}-{mes:02d}"
+            fecha_hasta = f"{ano:04d}-{mes:02d}"
+        
+        conn = get_db_connection()
+        
+        # Obtener turnos y calendario
+        turnos = conn.execute('SELECT id, nombre FROM turnos ORDER BY nombre').fetchall()
+        calendario_rango = conn.execute('''
+            SELECT ct.turno_id, ct.fecha, ct.codigo, t.nombre as turno_nombre
+            FROM calendario_turnos ct
+            JOIN turnos t ON ct.turno_id = t.id
+            WHERE ct.fecha >= ? AND ct.fecha <= ?
+            ORDER BY ct.fecha, t.nombre
+        ''', (fecha_desde + '-01', fecha_hasta + '-31')).fetchall()
+        conn.close()
+        
+        # Organizar datos
+        nombres_meses = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+                        'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+        dias_semana = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+        dias_festivos = {'01-01', '04-18', '04-19', '05-01', '05-21', '06-20', 
+                        '07-16', '08-15', '09-18', '09-19', '10-31', '11-01', 
+                        '12-08', '12-25'}
+        
+        # Organizar calendario por mes
+        calendario_dict = {}
+        for reg in calendario_rango:
+            fecha_obj = datetime.strptime(reg['fecha'], '%Y-%m-%d').date()
+            ano_mes = f"{fecha_obj.year}-{fecha_obj.month:02d}"
+            
+            if ano_mes not in calendario_dict:
+                calendario_dict[ano_mes] = {}
+            if reg['turno_nombre'] not in calendario_dict[ano_mes]:
+                calendario_dict[ano_mes][reg['turno_nombre']] = {}
+            calendario_dict[ano_mes][reg['turno_nombre']][fecha_obj] = reg['codigo']
+        
+        # CSS OPTIMIZADO para una página por mes
+        css_content = """
+        @page {
+            size: A4 landscape;
+            margin: 8mm 6mm;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 8pt;
+            color: #2c3e50;
+            line-height: 1.1;
+        }
+        
+        .page {
+            width: 100%;
+            height: 100vh;
+            page-break-after: always;
+            page-break-inside: avoid;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .page:last-child {
+            page-break-after: avoid;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 4mm;
+            padding: 3mm 0;
+            border-bottom: 1pt solid #2980b9;
+            background: linear-gradient(135deg, #ecf0f1, #bdc3c7);
+            flex-shrink: 0;
+        }
+        
+        .title {
+            font-size: 14pt;
+            font-weight: bold;
+            color: #2c3e50;
+            text-transform: uppercase;
+            letter-spacing: 1pt;
+        }
+        
+        .calendar {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-height: calc(100vh - 20mm);
+        }
+        
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            flex: 1;
+            font-size: 7pt;
+        }
+        
+        .table th {
+            background: linear-gradient(135deg, #3498db, #2980b9);
+            color: white;
+            font-weight: bold;
+            font-size: 8pt;
+            padding: 3pt 2pt;
+            border: 0.5pt solid #2c3e50;
+            text-align: center;
+            vertical-align: middle;
+            height: 10mm;
+            text-transform: uppercase;
+            letter-spacing: 0.2pt;
+        }
+        
+        .table td {
+            border: 0.5pt solid #34495e;
+            padding: 2pt;
+            text-align: center;
+            vertical-align: middle;
+            font-size: 7pt;
+            line-height: 1.1;
+            height: auto;
+        }
+        
+        .fecha {
+            background-color: #ecf0f1 !important;
+            text-align: left !important;
+            width: 18% !important;
+            font-weight: 600;
+            padding-left: 3pt !important;
+            font-size: 7pt;
+        }
+        
+        .trabajo {
+            background-color: #d5e8d4 !important;
+            color: #2d5016 !important;
+            font-weight: bold !important;
+        }
+        
+        .descanso {
+            background-color: #27ae60 !important;
+            color: white !important;
+            font-weight: bold !important;
+        }
+        
+        .festivo {
+            background-color: #e74c3c !important;
+            color: white !important;
+            font-weight: bold !important;
+        }
+        
+        .weekend {
+            background-color: #f8f9fa !important;
+            font-style: italic;
+        }
+        
+        .vacio {
+            background-color: #ffffff !important;
+            color: #95a5a6 !important;
+        }
+        
+        .legend {
+            margin-top: 2mm;
+            display: flex;
+            justify-content: center;
+            gap: 8pt;
+            font-size: 5pt;
+            flex-shrink: 0;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 2pt;
+            padding: 1pt 3pt;
+            border: 0.5pt solid #bdc3c7;
+            border-radius: 1pt;
+        }
+        
+        .legend-color {
+            width: 6pt;
+            height: 6pt;
+            border: 0.5pt solid #333;
+            display: inline-block;
+        }
+        """
+        
+        # Generar páginas individuales por mes
+        fecha_inicio = datetime.strptime(fecha_desde + '-01', '%Y-%m-%d').date()
+        fecha_fin_obj = datetime.strptime(fecha_hasta + '-01', '%Y-%m-%d').date()
+        
+        fecha_actual = fecha_inicio
+        pages_html = []
+        
+        while fecha_actual.year < fecha_fin_obj.year or (fecha_actual.year == fecha_fin_obj.year and fecha_actual.month <= fecha_fin_obj.month):
+            ano_mes = f"{fecha_actual.year}-{fecha_actual.month:02d}"
+            mes_nombre = nombres_meses[fecha_actual.month - 1].title()
+            ultimo_dia_mes = calendar.monthrange(fecha_actual.year, fecha_actual.month)[1]
+            
+            # HTML para esta página/mes
+            page_html = f"""
+            <div class="page">
+                <div class="header">
+                    <div class="title">{mes_nombre} {fecha_actual.year}</div>
+                </div>
+                
+                <div class="calendar">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Fecha</th>
+            """
+            
+            for turno in turnos:
+                page_html += f'<th>{turno["nombre"]}</th>'
+            
+            page_html += """
+                            </tr>
+                        </thead>
+                        <tbody>
+            """
+            
+            # Filas de días - LIMITADAS para caber en una página
+            max_filas = min(ultimo_dia_mes, 31)  # Máximo 31 días por página
+            
+            for dia in range(1, max_filas + 1):
+                fecha_dia = fecha_actual.replace(day=dia)
+                dia_semana = dias_semana[fecha_dia.weekday()]
+                fecha_formateada = f"{dia_semana}, {dia:02d}"  # Día completo
+                
+                es_weekend = fecha_dia.weekday() >= 5
+                es_festivo = f"{fecha_dia.month:02d}-{fecha_dia.day:02d}" in dias_festivos
+                
+                clase_fecha = 'fecha'
+                if es_weekend:
+                    clase_fecha += ' weekend'
+                if es_festivo:
+                    clase_fecha += ' festivo'
+                
+                page_html += f'<tr><td class="{clase_fecha}">{fecha_formateada}</td>'
+                
+                for turno in turnos:
+                    codigo = ''
+                    if ano_mes in calendario_dict and turno['nombre'] in calendario_dict[ano_mes]:
+                        codigo = calendario_dict[ano_mes][turno['nombre']].get(fecha_dia, '')
+                    
+                    if es_festivo and codigo in ['T', 'D', '']:
+                        clase_css = 'festivo'
+                    elif codigo == 'T':
+                        clase_css = 'trabajo'
+                    elif codigo == 'D':
+                        clase_css = 'descanso'
+                    else:
+                        clase_css = 'vacio'
+                    
+                    page_html += f'<td class="{clase_css}">{codigo}</td>'
+                
+                page_html += '</tr>'
+            
+            page_html += """
+                        </tbody>
+                    </table>
+                    
+                    <div class="legend">
+                        <div class="legend-item">
+                            <span class="legend-color" style="background-color: #d5e8d4; border-color: #2d5016;"></span>
+                            <span><strong>T</strong> = Trabajo</span>
+                        </div>
+                        <div class="legend-item">
+                            <span class="legend-color" style="background-color: #27ae60;"></span>
+                            <span><strong>D</strong> = Descanso</span>
+                        </div>
+                        <div class="legend-item">
+                            <span class="legend-color" style="background-color: #e74c3c;"></span>
+                            <span>Días Festivos</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
+            
+            pages_html.append(page_html)
+            
+            # Siguiente mes
+            if fecha_actual.month == 12:
+                fecha_actual = fecha_actual.replace(year=fecha_actual.year + 1, month=1)
+            else:
+                fecha_actual = fecha_actual.replace(month=fecha_actual.month + 1)
+        
+        # Combinar todas las páginas en un solo HTML
+        html_completo = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Calendario de Turnos</title>
+            <style>{css_content}</style>
+        </head>
+        <body>
+        {''.join(pages_html)}
+        </body>
+        </html>
+        """
+        
+        print(f"Generando PDF con {len(pages_html)} páginas...")
+        
+        # Generar PDF
+        html_doc = HTML(string=html_completo)
+        pdf_bytes = html_doc.write_pdf()
+        
+        print("PDF generado exitosamente - Un mes por página garantizado")
+        
+        # Nombre del archivo
+        if fecha_desde == fecha_hasta:
+            mes_num = int(fecha_desde.split('-')[1])
+            ano_num = int(fecha_desde.split('-')[0])
+            filename = f'calendario_turnos_{nombres_meses[mes_num-1]}_{ano_num}.pdf'
+        else:
+            filename = f'calendario_turnos_{fecha_desde}_al_{fecha_hasta}.pdf'
+        
+        return send_file(
+            BytesIO(pdf_bytes),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=filename
+        )
+        
+    except ImportError as e:
+        print(f"WeasyPrint no está instalado: {e}")
+        flash('Para usar PDF necesita: pip install weasyprint', 'error')
+        return redirect(url_for('gestion_turnos'))
+        
+    except Exception as e:
+        print(f"Error generando PDF: {e}")
+        import traceback
+        traceback.print_exc()
+        flash(f'Error generando PDF: {str(e)}', 'error')
+        return redirect(url_for('gestion_turnos'))
+
+
+@app.route('/eliminar_turno/<int:turno_id>', methods=['POST'])
+def eliminar_turno(turno_id):
+    conn = get_db_connection()
+    
+    # Verificar si hay empleados asignados
+    empleados = conn.execute('SELECT COUNT(*) as count FROM empleados WHERE turno_id = ?', 
+                           (turno_id,)).fetchone()
+    
+    if empleados['count'] > 0:
+        flash('No se puede eliminar el turno porque tiene empleados asignados.', 'error')
+    else:
+        # Eliminar calendario del turno
+        conn.execute('DELETE FROM calendario_turnos WHERE turno_id = ?', (turno_id,))
+        # Eliminar turno
+        conn.execute('DELETE FROM turnos WHERE id = ?', (turno_id,))
+        conn.commit()
+        flash('Turno eliminado exitosamente.', 'success')
+    
+    conn.close()
+    return redirect(url_for('gestion_turnos'))
+
+if __name__ == '__main__':
+    app.run(debug=True)
